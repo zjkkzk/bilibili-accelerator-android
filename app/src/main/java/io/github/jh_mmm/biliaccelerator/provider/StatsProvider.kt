@@ -67,7 +67,7 @@ class StatsProvider : ContentProvider() {
 
     companion object {
         val AUTHORITY = "${BuildConfig.APPLICATION_ID}.provider"
-        val CONTENT_URI: Uri = Uri.parse("content://$AUTHORITY")
+        val CONTENT_URI: Uri by lazy { Uri.parse("content://$AUTHORITY") }
 
         const val METHOD_RECORD_BATCH_REWRITE = "recordBatchRewrite"
         const val METHOD_GET_CONFIG = "getConfig"
@@ -104,6 +104,8 @@ class StatsProvider : ContentProvider() {
         const val KEY_BTR_CDN_POOL_SIZE = "cfg_btr_cdn_pool_size"
         const val KEY_ENABLE_EPISODE_ACCELERATION = "cfg_enable_episode_acceleration"
         const val KEY_ENABLE_LIVE_ACCELERATION = "cfg_enable_live_acceleration"
+        const val KEY_SELECTION_MODE = "cfg_selection_mode"
+        const val KEY_STALL_RECOVERY = "cfg_stall_recovery"
 
         private val gson = Gson()
         private val configPushExecutor = Executors.newSingleThreadExecutor { r ->
@@ -152,53 +154,60 @@ class StatsProvider : ContentProvider() {
                 emptyList()
             }
 
-            return AcceleratorConfig(
-                enabled = sp.getBoolean(KEY_ENABLED, true),
-                targetHost = sp.getString(KEY_TARGET_HOST, "upos-sz-mirrorcos.bilivideo.com") ?: "upos-sz-mirrorcos.bilivideo.com",
-                proxyHost = sp.getString(KEY_PROXY_HOST, "proxy-tf-all-ws.bilivideo.com") ?: "proxy-tf-all-ws.bilivideo.com",
-                blockPcdn = sp.getBoolean(KEY_BLOCK_PCDN, true),
-                proxyMcdn = sp.getBoolean(KEY_PROXY_MCDN, true),
-                mcdnStrategy = BiliAcceleratorCore.normalizeMcdnStrategy(sp.getString(KEY_MCDN_STRATEGY, "proxy-all")),
-                forceUpos = sp.getBoolean(KEY_FORCE_UPOS, false),
-                rewriteAkamai = sp.getBoolean(KEY_REWRITE_AKAMAI, false),
-                portHeuristic = sp.getBoolean(KEY_PORT_HEURISTIC, true),
-                enableMossHook = sp.getBoolean(KEY_ENABLE_MOSS_HOOK, false),
-                enableBtr = sp.getBoolean(KEY_ENABLE_BTR, true),
-                btrAutoConcurrency = sp.getBoolean(KEY_BTR_AUTO_CONCURRENCY, true),
-                btrConcurrency = sp.getInt(KEY_BTR_CONCURRENCY, 6),
-                btrAutoChunkSize = sp.getBoolean(KEY_BTR_AUTO_CHUNK_SIZE, true),
-                btrChunkSizeKb = sp.getInt(KEY_BTR_CHUNK_SIZE_KB, 512),
-                customCdnPool = customPool,
-                btrCdnPoolSize = sp.getInt(KEY_BTR_CDN_POOL_SIZE, 8),
-                enableEpisodeAcceleration = sp.getBoolean(KEY_ENABLE_EPISODE_ACCELERATION, true),
-                enableLiveAcceleration = sp.getBoolean(KEY_ENABLE_LIVE_ACCELERATION, false)
+            return BiliAcceleratorCore.normalizeConfig(
+                AcceleratorConfig(
+                    enabled = sp.getBoolean(KEY_ENABLED, true),
+                    targetHost = sp.getString(KEY_TARGET_HOST, "upos-sz-mirrorcos.bilivideo.com") ?: "upos-sz-mirrorcos.bilivideo.com",
+                    proxyHost = sp.getString(KEY_PROXY_HOST, "proxy-tf-all-ws.bilivideo.com") ?: "proxy-tf-all-ws.bilivideo.com",
+                    blockPcdn = sp.getBoolean(KEY_BLOCK_PCDN, true),
+                    proxyMcdn = sp.getBoolean(KEY_PROXY_MCDN, true),
+                    mcdnStrategy = BiliAcceleratorCore.normalizeMcdnStrategy(sp.getString(KEY_MCDN_STRATEGY, "proxy-all")),
+                    forceUpos = sp.getBoolean(KEY_FORCE_UPOS, false),
+                    rewriteAkamai = sp.getBoolean(KEY_REWRITE_AKAMAI, false),
+                    portHeuristic = sp.getBoolean(KEY_PORT_HEURISTIC, true),
+                    enableMossHook = sp.getBoolean(KEY_ENABLE_MOSS_HOOK, false),
+                    enableBtr = sp.getBoolean(KEY_ENABLE_BTR, true),
+                    btrAutoConcurrency = sp.getBoolean(KEY_BTR_AUTO_CONCURRENCY, true),
+                    btrConcurrency = sp.getInt(KEY_BTR_CONCURRENCY, 6),
+                    btrAutoChunkSize = sp.getBoolean(KEY_BTR_AUTO_CHUNK_SIZE, true),
+                    btrChunkSizeKb = sp.getInt(KEY_BTR_CHUNK_SIZE_KB, 512),
+                    customCdnPool = customPool,
+                    btrCdnPoolSize = sp.getInt(KEY_BTR_CDN_POOL_SIZE, 8),
+                    enableEpisodeAcceleration = sp.getBoolean(KEY_ENABLE_EPISODE_ACCELERATION, true),
+                    enableLiveAcceleration = sp.getBoolean(KEY_ENABLE_LIVE_ACCELERATION, false),
+                    selectionMode = BiliAcceleratorCore.normalizeSelectionMode(sp.getString(KEY_SELECTION_MODE, "auto")),
+                    stallRecovery = sp.getBoolean(KEY_STALL_RECOVERY, true)
+                )
             )
         }
 
         fun saveConfig(context: Context, config: AcceleratorConfig) {
+            val normalizedConfig = BiliAcceleratorCore.normalizeConfig(config)
             val sp = context.getSharedPreferences(PREFS_CONFIG, Context.MODE_PRIVATE)
             sp.edit()
-                .putBoolean(KEY_ENABLED, config.enabled)
-                .putString(KEY_TARGET_HOST, config.targetHost)
-                .putString(KEY_PROXY_HOST, config.proxyHost)
-                .putBoolean(KEY_BLOCK_PCDN, config.blockPcdn)
-                .putBoolean(KEY_PROXY_MCDN, config.proxyMcdn)
-                .putString(KEY_MCDN_STRATEGY, BiliAcceleratorCore.normalizeMcdnStrategy(config.mcdnStrategy))
-                .putBoolean(KEY_FORCE_UPOS, config.forceUpos)
-                .putBoolean(KEY_REWRITE_AKAMAI, config.rewriteAkamai)
-                .putBoolean(KEY_PORT_HEURISTIC, config.portHeuristic)
-                .putBoolean(KEY_ENABLE_MOSS_HOOK, config.enableMossHook)
-                .putBoolean(KEY_ENABLE_BTR, config.enableBtr)
-                .putBoolean(KEY_BTR_AUTO_CONCURRENCY, config.btrAutoConcurrency)
-                .putInt(KEY_BTR_CONCURRENCY, config.btrConcurrency)
-                .putBoolean(KEY_BTR_AUTO_CHUNK_SIZE, config.btrAutoChunkSize)
-                .putInt(KEY_BTR_CHUNK_SIZE_KB, config.btrChunkSizeKb)
-                .putString(KEY_CUSTOM_CDN_POOL, gson.toJson(config.customCdnPool))
-                .putInt(KEY_BTR_CDN_POOL_SIZE, config.btrCdnPoolSize)
-                .putBoolean(KEY_ENABLE_EPISODE_ACCELERATION, config.enableEpisodeAcceleration)
-                .putBoolean(KEY_ENABLE_LIVE_ACCELERATION, config.enableLiveAcceleration)
+                .putBoolean(KEY_ENABLED, normalizedConfig.enabled)
+                .putString(KEY_TARGET_HOST, normalizedConfig.targetHost)
+                .putString(KEY_PROXY_HOST, normalizedConfig.proxyHost)
+                .putBoolean(KEY_BLOCK_PCDN, normalizedConfig.blockPcdn)
+                .putBoolean(KEY_PROXY_MCDN, normalizedConfig.proxyMcdn)
+                .putString(KEY_MCDN_STRATEGY, normalizedConfig.mcdnStrategy)
+                .putBoolean(KEY_FORCE_UPOS, normalizedConfig.forceUpos)
+                .putBoolean(KEY_REWRITE_AKAMAI, normalizedConfig.rewriteAkamai)
+                .putBoolean(KEY_PORT_HEURISTIC, normalizedConfig.portHeuristic)
+                .putBoolean(KEY_ENABLE_MOSS_HOOK, normalizedConfig.enableMossHook)
+                .putBoolean(KEY_ENABLE_BTR, normalizedConfig.enableBtr)
+                .putBoolean(KEY_BTR_AUTO_CONCURRENCY, normalizedConfig.btrAutoConcurrency)
+                .putInt(KEY_BTR_CONCURRENCY, normalizedConfig.btrConcurrency)
+                .putBoolean(KEY_BTR_AUTO_CHUNK_SIZE, normalizedConfig.btrAutoChunkSize)
+                .putInt(KEY_BTR_CHUNK_SIZE_KB, normalizedConfig.btrChunkSizeKb)
+                .putString(KEY_CUSTOM_CDN_POOL, gson.toJson(normalizedConfig.customCdnPool))
+                .putInt(KEY_BTR_CDN_POOL_SIZE, normalizedConfig.btrCdnPoolSize)
+                .putBoolean(KEY_ENABLE_EPISODE_ACCELERATION, normalizedConfig.enableEpisodeAcceleration)
+                .putBoolean(KEY_ENABLE_LIVE_ACCELERATION, normalizedConfig.enableLiveAcceleration)
+                .putString(KEY_SELECTION_MODE, normalizedConfig.selectionMode)
+                .putBoolean(KEY_STALL_RECOVERY, normalizedConfig.stallRecovery)
                 .apply()
-            val configJson = gson.toJson(config)
+            val configJson = gson.toJson(normalizedConfig)
             runCatching {
                 context.contentResolver.notifyChange(CONTENT_URI, null)
             }

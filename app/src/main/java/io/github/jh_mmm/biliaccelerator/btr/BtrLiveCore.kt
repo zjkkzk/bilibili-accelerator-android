@@ -153,16 +153,25 @@ class BtrLiveHostPool(
 object BtrLiveCore {
 
     /**
-     * BTR 已知国内 fMP4 HLS 官方镜像集群（支持同源签名跨节点拉取，仅保留国内节点避免跨境高延迟或断联）
+     * BTR 已知国内与海外 fMP4 HLS 官方镜像集群（对齐上游 live-core.js KNOWN_FMP4_HOSTS：
+     * 集群内节点支持同源签名跨节点互认拉取；由 probeCandidates 首包 TTFB 探测与 EWMA 评分根据用户所在位置自然优选低延迟国内或海外节点）
      */
     val KNOWN_FMP4_HOSTS = listOf(
         "d1--cn-gotcha204.bilivideo.com",
-        "d1--cn-gotcha208.bilivideo.com"
+        "d1--cn-gotcha208.bilivideo.com",
+        "d1--ov-gotcha208.bilivideo.com",
+        "d1--ov-gotcha208b.bilivideo.com"
     )
 
     private val LIVE_HOST_REGEX = Regex("""(?:\.|^)bilivideo\.(com|cn|net)$""", RegexOption.IGNORE_CASE)
+    private val VOD_ONLY_HOST_PREFIX_REGEX = Regex("""^(?:upos|proxy)-""", RegexOption.IGNORE_CASE)
+    private val LIVE_GOTCHA_HOST_REGEX = Regex(
+        """^(?:[a-z0-9-]+--)?(?:cn|ov)-gotcha[a-z0-9-]*\.bilivideo\.(?:com|cn|net)$""",
+        RegexOption.IGNORE_CASE
+    )
+    private val LIVE_BVC_NUMERIC_ROUTE_REGEX = Regex("""^/live-bvc/\d+/""", RegexOption.IGNORE_CASE)
     private val PROXY_WRAP_REGEX = Regex(
-        """^(https?:)//[\w.-]+\.smtcdns\.(?:net|com)/((?:\[[0-9a-f:]+\]|(?:\d{1,3}\.){3}\d{1,3}|(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63}|xn--[a-z0-9]{2,59}))(?::\d{1,5})?)(/.*)$""",
+        """^(https?:)//[\w.-]+\.smtcdns\.(?:net|com)/((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+bilivideo\.(?:com|cn|net)(?::\d{1,5})?)(/.*)$""",
         RegexOption.IGNORE_CASE
     )
 
@@ -193,24 +202,63 @@ object BtrLiveCore {
         }
     }
 
+    private fun extractPortFromAuthority(authority: String): Int {
+        val trimmed = authority.trim()
+        if (trimmed.isEmpty()) return -1
+        if (trimmed.startsWith("[")) {
+            val closeIdx = trimmed.indexOf(']')
+            if (closeIdx <= 0 || closeIdx + 1 >= trimmed.length) return -1
+            val rest = trimmed.substring(closeIdx + 1)
+            if (!rest.startsWith(":")) return -1
+            return rest.substring(1).toIntOrNull()?.takeIf { it in 1..65535 } ?: -1
+        }
+        if (trimmed.count { it == ':' } == 1) {
+            return trimmed.substringAfter(':').toIntOrNull()?.takeIf { it in 1..65535 } ?: -1
+        }
+        return -1
+    }
+
+    private fun isLoopbackBareHost(bareHost: String): Boolean {
+        val h = bareHost.lowercase()
+        return h == "localhost" ||
+            h == "127.0.0.1" ||
+            h.startsWith("127.") ||
+            h == "::1" ||
+            h == "0:0:0:0:0:0:0:1" ||
+            h.startsWith("::ffff:127.")
+    }
+
     fun isP2pUrl(value: String): Boolean {
         val trimmed = value.trim()
         if (trimmed.isEmpty()) return false
-        val parsedHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(trimmed)?.host).lowercase()
-        val host = parsedHost.ifBlank {
-            val cleaned = BiliAcceleratorCore.cleanHost(trimmed).lowercase().substringBefore('/')
-            when {
-                cleaned.startsWith("[") -> cleaned.substringBefore(']') + "]"
-                cleaned.count { it == ':' } == 1 -> cleaned.substringBefore(':')
-                else -> cleaned
-            }
+        val parsed = BiliAcceleratorCore.parseUri(trimmed)
+        val parsedHostRaw = parsed?.host?.let { BiliAcceleratorCore.cleanHost(it).lowercase() }.orEmpty()
+        val host: String
+        val port: Int
+        if (parsed != null && parsedHostRaw.isNotBlank()) {
+            host = stripPortFromAuthority(parsedHostRaw)
+            port = if (parsed.port > 0) parsed.port else extractPortFromAuthority(parsedHostRaw)
+        } else {
+            val cleanedAuth = BiliAcceleratorCore.cleanHost(trimmed).lowercase()
+            host = stripPortFromAuthority(cleanedAuth)
+            port = extractPortFromAuthority(cleanedAuth)
         }
         if (host.isBlank()) return false
         val bareHost = host.removeSurrounding("[", "]")
-        if (bareHost == "127.0.0.1" || bareHost == "::1" || bareHost == "0:0:0:0:0:0:0:1" || bareHost == "localhost") {
+        if (isLoopbackBareHost(bareHost)) {
             return false
         }
-        return BiliAcceleratorCore.isIpAddress(host) ||
+        val hasNonStandardPort = port > 0 && port != 80 && port != 443
+        val queryPart = trimmed.substringAfter('?', "").substringBefore('#')
+        val hasOsMcdn = queryPart.isNotEmpty() && queryPart.split('&').any { param ->
+            val eq = param.indexOf('=')
+            eq > 0 &&
+                param.substring(0, eq).equals("os", ignoreCase = true) &&
+                param.substring(eq + 1).equals("mcdn", ignoreCase = true)
+        }
+        return hasNonStandardPort ||
+            hasOsMcdn ||
+            BiliAcceleratorCore.isIpAddress(host) ||
             BiliAcceleratorCore.isKnownP2pHost(host) ||
             BiliAcceleratorCore.isMcdnHost(host) ||
             host.split(".").firstOrNull()?.contains("302") == true
@@ -218,6 +266,7 @@ object BtrLiveCore {
 
     /**
      * 将商业中继代理包装的 URL 解包恢复至官方源节点 (对齐 BTR unwrapProxyUrl)
+     * 仅允许严格 *.bilivideo.(com|cn|net) 内部官方域名，防止误拆普通点号路径或重定向至任意/回环主机。
      * e.g. https://xxx.smtcdns.net/d1--yy.bilivideo.com/... -> https://d1--yy.bilivideo.com/...
      */
     fun unwrapProxyUrl(value: String): String {
@@ -230,39 +279,39 @@ object BtrLiveCore {
     }
 
     private fun isValidUnwrappedAuthority(authority: String): Boolean {
-        val hostPart: String
-        if (authority.startsWith("[")) {
-            val closeIdx = authority.indexOf(']')
-            if (closeIdx <= 1) return false
-            hostPart = authority.substring(1, closeIdx)
-            if (hostPart.count { it == ':' } < 2) return false
-            val suffix = authority.substring(closeIdx + 1)
-            if (suffix.isNotEmpty()) {
-                val port = suffix.removePrefix(":").toIntOrNull() ?: return false
-                if (port !in 1..65535) return false
-            }
-            return true
-        }
         val colonIdx = authority.lastIndexOf(':')
-        if (colonIdx >= 0) {
-            hostPart = authority.substring(0, colonIdx)
+        val hostPart = if (colonIdx >= 0) {
             val port = authority.substring(colonIdx + 1).toIntOrNull() ?: return false
             if (port !in 1..65535) return false
+            authority.substring(0, colonIdx)
         } else {
-            hostPart = authority
+            authority
         }
-        if (hostPart.matches(IPV4_STRICT_HINT_REGEX)) {
-            val parts = hostPart.split('.')
-            if (parts.size != 4) return false
-            return parts.all { octet ->
-                val n = octet.toIntOrNull() ?: return@all false
-                n in 0..255
-            }
-        }
-        return hostPart.isNotEmpty()
+        return hostPart.isNotEmpty() && LIVE_HOST_REGEX.containsMatchIn(hostPart)
     }
 
-    private val IPV4_STRICT_HINT_REGEX = Regex("""^\d+\.\d+\.\d+\.\d+$""")
+    /**
+     * 归一化直播分片与 #EXT-X-MAP 初始化分片缓存键：
+     * 剥离协议/主机/端口与易变鉴权 Query，并将 /live-bvc/<routeId>/ 归一化为 /live-bvc/，
+     * 使播放列表跨节点/跨厂商故障切换后仍可命中已预取的分片与初始化头，同时保留不同清晰度子目录隔离。
+     */
+    fun normalizeCacheKey(url: String): String {
+        val trimmed = url.trim()
+        if (trimmed.isEmpty()) return ""
+        val unwrapped = unwrapProxyUrl(trimmed).ifBlank { trimmed }
+        val parts = parseRawHttpUrl(unwrapped)
+        val rawPath = parts?.rawPath
+            ?: unwrapped.substringBefore('#').substringBefore('?')
+        val cleanPath = rawPath.ifBlank { return unwrapped }
+        val liveBvcIdx = cleanPath.indexOf("/live-bvc/", ignoreCase = true)
+        val canonical = if (liveBvcIdx >= 0) {
+            val fromBvc = cleanPath.substring(liveBvcIdx)
+            LIVE_BVC_NUMERIC_ROUTE_REGEX.replaceFirst(fromBvc, "/live-bvc/")
+        } else {
+            cleanPath
+        }
+        return canonical.lowercase()
+    }
 
     fun segmentNumber(name: String): Long {
         val cleanName = name.substringBefore('?').substringBefore('#')
@@ -325,6 +374,247 @@ object BtrLiveCore {
         return if (trimmed.count { it == ':' } == 1) trimmed.substringBefore(':') else trimmed
     }
 
+    fun isKnownFmp4Host(host: String): Boolean {
+        val clean = stripPortFromAuthority(BiliAcceleratorCore.cleanHost(host)).lowercase()
+        if (clean.isBlank()) return false
+        return KNOWN_FMP4_HOSTS.any { it.equals(clean, ignoreCase = true) }
+    }
+
+    fun isVodOnlyHost(host: String): Boolean {
+        val clean = stripPortFromAuthority(BiliAcceleratorCore.cleanHost(host)).lowercase()
+        if (clean.isBlank()) return false
+        return VOD_ONLY_HOST_PREFIX_REGEX.containsMatchIn(clean)
+    }
+
+    fun isLiveCompatibleCustomHost(host: String): Boolean {
+        val clean = stripPortFromAuthority(BiliAcceleratorCore.cleanHost(host)).lowercase()
+        if (clean.isBlank()) return false
+        if (isVodOnlyHost(clean) || isP2pUrl(clean)) return false
+        if (!LIVE_HOST_REGEX.containsMatchIn(clean)) return false
+        return isKnownFmp4Host(clean) || LIVE_GOTCHA_HOST_REGEX.matches(clean)
+    }
+
+    fun filterLiveCustomHosts(hosts: Collection<String>?): List<String> {
+        if (hosts.isNullOrEmpty()) return emptyList()
+        return hosts.asSequence()
+            .map { stripPortFromAuthority(BiliAcceleratorCore.cleanHost(it)).lowercase() }
+            .filter { it.isNotBlank() && isLiveCompatibleCustomHost(it) }
+            .distinct()
+            .toList()
+    }
+
+    fun areHostsSignatureCompatible(sourceHost: String, targetHost: String): Boolean {
+        val cleanSource = stripPortFromAuthority(BiliAcceleratorCore.cleanHost(sourceHost)).lowercase()
+        val cleanTarget = stripPortFromAuthority(BiliAcceleratorCore.cleanHost(targetHost)).lowercase()
+        if (cleanSource.isBlank() || cleanTarget.isBlank()) return false
+        if (cleanSource == cleanTarget) return true
+        return isKnownFmp4Host(cleanSource) && isKnownFmp4Host(cleanTarget)
+    }
+
+    private data class RawHttpUrlParts(
+        val scheme: String,
+        val rawAuthority: String,
+        val hostOnly: String,
+        val rawPath: String,
+        val rawQuery: String?,
+        val rawFragment: String?
+    )
+
+    private fun parseRawHttpUrl(rawUrl: String): RawHttpUrlParts? {
+        val unwrapped = unwrapProxyUrl(rawUrl).ifBlank { rawUrl.trim() }
+        if (unwrapped.isEmpty()) return null
+        val normalized = if (unwrapped.startsWith("//")) "https:$unwrapped" else unwrapped
+        val fragIdx = normalized.indexOf('#')
+        val noFrag = if (fragIdx >= 0) normalized.substring(0, fragIdx) else normalized
+        val rawFragment = if (fragIdx >= 0) normalized.substring(fragIdx + 1) else null
+
+        val queryIdx = noFrag.indexOf('?')
+        val noQuery = if (queryIdx >= 0) noFrag.substring(0, queryIdx) else noFrag
+        val rawQuery = if (queryIdx >= 0) noFrag.substring(queryIdx + 1) else null
+
+        val schemeSep = noQuery.indexOf("://")
+        if (schemeSep <= 0) return null
+        val scheme = noQuery.substring(0, schemeSep).lowercase()
+        if (scheme != "http" && scheme != "https") return null
+
+        val afterScheme = noQuery.substring(schemeSep + 3)
+        val pathIdx = afterScheme.indexOf('/')
+        val rawAuthority = if (pathIdx >= 0) afterScheme.substring(0, pathIdx) else afterScheme
+        if (rawAuthority.isBlank()) return null
+        val rawPath = if (pathIdx >= 0) afterScheme.substring(pathIdx) else ""
+        val hostWithoutUserInfo = rawAuthority.substringAfter('@')
+        val hostOnly = stripPortFromAuthority(hostWithoutUserInfo).lowercase()
+        if (hostOnly.isBlank()) return null
+
+        return RawHttpUrlParts(
+            scheme = scheme,
+            rawAuthority = rawAuthority,
+            hostOnly = hostOnly,
+            rawPath = rawPath,
+            rawQuery = rawQuery,
+            rawFragment = rawFragment
+        )
+    }
+
+    /**
+     * 为指定候选直播节点构建目标分片/探测/播放列表 URL（解决多源异构 CDN 鉴权签名不互通引发 HTTP 403 误封问题）：
+     * 1. 若 liveHostUrls 中存在目标节点的专属签名 URL，提取该节点的 scheme/host/port、基础路径前缀与专属鉴权 Query 参数，
+     *    同时保留请求 URL (segmentUrl) 的分片文件名或相对子路径；
+     * 2. 若目标节点与源节点同属 KNOWN_FMP4_HOSTS 同源签名互认集群（或 liveHostUrls 含同集群 Donor URL），使用 swapHost 跨节点复用签名；
+     * 3. 若候选节点来自不同 CDN 厂商且在 liveHostUrls 中无专属签名 URL（亦不在同一 KNOWN_FMP4_HOSTS 互认集群内），
+     *    返回 null 以拒绝发送不匹配的鉴权签名，避免触发无谓的 HTTP 403 节点封禁。
+     */
+    fun resolveTargetUrlForHost(
+        segmentUrl: String,
+        targetHost: String,
+        liveHostUrls: Map<String, String> = emptyMap(),
+        primaryUrl: String? = null,
+        customPoolOnly: Boolean = false
+    ): String? {
+        val normalizedSegUrl = unwrapProxyUrl(segmentUrl).ifBlank { segmentUrl.trim() }
+        val segParts = parseRawHttpUrl(normalizedSegUrl) ?: return null
+        val cleanTargetAuth = BiliAcceleratorCore.cleanHost(targetHost)
+        if (cleanTargetAuth.isBlank()) return null
+        val targetHostOnly = stripPortFromAuthority(cleanTargetAuth).lowercase()
+        if (targetHostOnly.isBlank()) return null
+        val targetAuthLower = cleanTargetAuth.lowercase()
+        val hasExplicitTargetPort = !cleanTargetAuth.equals(targetHostOnly, ignoreCase = true)
+
+        val sourceHostOnly = segParts.hostOnly
+        val sourceRefUrl = liveHostUrls[segParts.rawAuthority.lowercase()]
+            ?: liveHostUrls[sourceHostOnly]
+            ?: primaryUrl
+        val sourceRefParts = sourceRefUrl?.let { parseRawHttpUrl(it) }
+
+        val mappedHostUrl = liveHostUrls[targetAuthLower]
+            ?: liveHostUrls[targetHostOnly]
+            ?: liveHostUrls.entries.firstOrNull { (k, _) ->
+                val kClean = BiliAcceleratorCore.cleanHost(k).lowercase()
+                kClean == targetAuthLower || stripPortFromAuthority(kClean) == targetHostOnly
+            }?.value
+
+        fun buildFromTemplate(
+            templateParts: RawHttpUrlParts,
+            overrideAuthority: String? = null,
+            keepSegPath: Boolean = false
+        ): String {
+            val finalScheme = templateParts.scheme
+            val finalAuthority = overrideAuthority
+                ?: if (hasExplicitTargetPort) cleanTargetAuth else templateParts.rawAuthority
+
+            val isSameEntryPath =
+                (segParts.rawPath.endsWith(".m3u8", ignoreCase = true) && templateParts.rawPath.endsWith(".m3u8", ignoreCase = true)) ||
+                (segParts.rawPath.endsWith(".flv", ignoreCase = true) && templateParts.rawPath.endsWith(".flv", ignoreCase = true))
+            val finalPath = if (keepSegPath) {
+                segParts.rawPath
+            } else if (
+                isSameEntryPath &&
+                (sourceRefParts == null || segParts.rawPath == sourceRefParts.rawPath)
+            ) {
+                templateParts.rawPath
+            } else {
+                val templateDir = if (templateParts.rawPath.endsWith("/")) {
+                    templateParts.rawPath.trimEnd('/')
+                } else {
+                    templateParts.rawPath.substringBeforeLast('/', "")
+                }
+                val sourceDir = sourceRefParts?.rawPath?.let { sp ->
+                    if (sp.endsWith("/")) sp.trimEnd('/') else sp.substringBeforeLast('/', "")
+                }.orEmpty()
+                val relSegPath = when {
+                    sourceDir.isNotEmpty() && segParts.rawPath.startsWith("$sourceDir/") ->
+                        segParts.rawPath.removePrefix("$sourceDir/")
+                    templateDir.isNotEmpty() && segParts.rawPath.startsWith("$templateDir/") ->
+                        segParts.rawPath.removePrefix("$templateDir/")
+                    else ->
+                        segParts.rawPath.substringAfterLast('/')
+                }
+                if (templateDir.isNotEmpty() && relSegPath.isNotEmpty()) {
+                    "$templateDir/$relSegPath"
+                } else {
+                    segParts.rawPath
+                }
+            }
+
+            val finalQuery = when {
+                !templateParts.rawQuery.isNullOrBlank() -> templateParts.rawQuery
+                areHostsSignatureCompatible(sourceHostOnly, targetHostOnly) -> segParts.rawQuery
+                else -> null
+            }
+            val qPart = if (!finalQuery.isNullOrEmpty()) "?$finalQuery" else ""
+            val fPart = if (!segParts.rawFragment.isNullOrEmpty()) "#${segParts.rawFragment}" else ""
+            return "$finalScheme://$finalAuthority$finalPath$qPart$fPart"
+        }
+
+        // 1. 目标节点即为分片当前源节点
+        if (targetHostOnly == sourceHostOnly) {
+            if (!segParts.rawQuery.isNullOrBlank()) {
+                return if (hasExplicitTargetPort) swapHost(normalizedSegUrl, cleanTargetAuth) else normalizedSegUrl
+            }
+            val sameHostTemplate = mappedHostUrl?.let { parseRawHttpUrl(it) } ?: sourceRefParts
+            if (sameHostTemplate != null && !sameHostTemplate.rawQuery.isNullOrBlank()) {
+                val auth = if (hasExplicitTargetPort) cleanTargetAuth else segParts.rawAuthority
+                return buildFromTemplate(sameHostTemplate, overrideAuthority = auth, keepSegPath = true)
+            }
+            return if (hasExplicitTargetPort) swapHost(normalizedSegUrl, cleanTargetAuth) else normalizedSegUrl
+        }
+
+        // 2. liveHostUrls 存在该候选节点的专属签名 URL：保留分片相对路径 + 替换该节点专属 scheme/authority/baseDir/query
+        if (!mappedHostUrl.isNullOrBlank()) {
+            val hostParts = parseRawHttpUrl(mappedHostUrl)
+            if (hostParts != null) {
+                return buildFromTemplate(hostParts)
+            }
+        }
+
+        // 严禁将点播专用节点（upos-*/proxy-*）用于直播流（/live-bvc/ 等），避免自定义点播 CDN 池破坏直播拉流
+        if (isVodOnlyHost(targetHostOnly)) {
+            return null
+        }
+
+        val isFlv = segParts.rawPath.endsWith(".flv", ignoreCase = true)
+
+        // 3. 源节点与目标节点同属 KNOWN_FMP4_HOSTS 同源签名互认集群（仅限 fMP4 HLS，FLV 各线路签名独立）
+        if (!isFlv && areHostsSignatureCompatible(sourceHostOnly, targetHostOnly)) {
+            if (segParts.rawQuery.isNullOrBlank() && sourceRefParts != null && !sourceRefParts.rawQuery.isNullOrBlank()) {
+                return buildFromTemplate(sourceRefParts, overrideAuthority = cleanTargetAuth, keepSegPath = true)
+            }
+            return swapHost(normalizedSegUrl, cleanTargetAuth)
+        }
+
+        // 4. 目标节点属于 KNOWN_FMP4_HOSTS，且 liveHostUrls 中存在另一 KNOWN_FMP4_HOSTS 节点的同源签名 Donor
+        if (!isFlv && isKnownFmp4Host(targetHostOnly)) {
+            val fmp4DonorParts = liveHostUrls.entries
+                .firstOrNull { (k, _) -> isKnownFmp4Host(k) }
+                ?.value
+                ?.let { parseRawHttpUrl(it) }
+            if (fmp4DonorParts != null) {
+                return buildFromTemplate(fmp4DonorParts, overrideAuthority = cleanTargetAuth)
+            }
+            if (isP2pUrl(normalizedSegUrl) && liveHostUrls.isEmpty()) {
+                return swapHost(normalizedSegUrl, cleanTargetAuth)
+            }
+        }
+
+        // 5. 用户显式启用仅自定义节点池模式（仅放行直播兼容节点，拒绝点播 UPOS 池覆盖直播）
+        if (customPoolOnly) {
+            if (!isLiveCompatibleCustomHost(targetHostOnly)) {
+                return null
+            }
+            return swapHost(normalizedSegUrl, cleanTargetAuth)
+        }
+
+        // 6. 完全无鉴权参数的流（如本地无签名单元测试）允许 swapHost；否则拒绝向异构无专属签名节点发送错配 Token
+        val hasAnySignedQuery = !segParts.rawQuery.isNullOrBlank() ||
+            !sourceRefParts?.rawQuery.isNullOrBlank() ||
+            liveHostUrls.values.any { !parseRawHttpUrl(it)?.rawQuery.isNullOrBlank() }
+        if (!hasAnySignedQuery) {
+            return swapHost(normalizedSegUrl, cleanTargetAuth)
+        }
+
+        return null
+    }
+
     fun swapHost(originalUrl: String, newHost: String): String {
         val normalized = unwrapProxyUrl(originalUrl).ifBlank { originalUrl }
         val cleanNewAuth = BiliAcceleratorCore.cleanHost(newHost)
@@ -336,7 +626,8 @@ object BtrLiveCore {
         val androidUri = runCatching { android.net.Uri.parse(normalized) }.getOrNull()
         val androidHost = runCatching { androidUri?.host }.getOrNull()
         if (androidUri != null && !androidHost.isNullOrBlank()) {
-            if ((!hasExplicitPort && newHostOnly.equals(androidHost, ignoreCase = true)) ||
+            val androidPort = runCatching { androidUri.port }.getOrDefault(-1)
+            if ((!hasExplicitPort && androidPort == -1 && newHostOnly.equals(androidHost, ignoreCase = true)) ||
                 cleanNewAuth.equals(androidUri.encodedAuthority, ignoreCase = true)
             ) {
                 return normalized
@@ -351,7 +642,8 @@ object BtrLiveCore {
         return try {
             val uri = URI(normalized)
             val origHost = uri.host ?: return normalized
-            if ((!hasExplicitPort && newHostOnly.equals(origHost, ignoreCase = true)) ||
+            val origPort = uri.port
+            if ((!hasExplicitPort && origPort == -1 && newHostOnly.equals(origHost, ignoreCase = true)) ||
                 cleanNewAuth.equals(uri.rawAuthority, ignoreCase = true)
             ) {
                 return normalized

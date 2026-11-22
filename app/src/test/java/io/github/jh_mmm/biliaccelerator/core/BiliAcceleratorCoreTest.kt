@@ -246,8 +246,8 @@ class BiliAcceleratorCoreTest {
 
     @Test
     fun testHasMediaSignal() {
-        assertTrue(BiliAcceleratorCore.hasMediaSignal("http://example.com/video.m4s"))
-        assertTrue(BiliAcceleratorCore.hasMediaSignal("http://example.com/audio.mp4?param=1"))
+        assertFalse("Third-party domain mp4/m4s must not match hasMediaSignal", BiliAcceleratorCore.hasMediaSignal("http://example.com/video.m4s"))
+        assertFalse("Third-party domain mp4/m4s must not match hasMediaSignal", BiliAcceleratorCore.hasMediaSignal("http://example.com/audio.mp4?param=1"))
         assertTrue(BiliAcceleratorCore.hasMediaSignal("http://test.bilivideo.com/data"))
         assertTrue(BiliAcceleratorCore.hasMediaSignal("http://unknown.com/upgcxcode/123"))
         assertFalse(BiliAcceleratorCore.hasMediaSignal("http://api.bilibili.com/x/v2/reply"))
@@ -269,7 +269,7 @@ class BiliAcceleratorCoreTest {
         val result = BiliAcceleratorCore.rewriteUrl(externalAd, defaultConfig)
         assertFalse("External third-party media should not be rewritten", result.changed)
         assertFalse("Should not be recognized as PCDN", result.isPcdn)
-        assertEquals("ok", result.reason)
+        assertEquals("ignored", result.reason)
     }
 
     @Test
@@ -473,12 +473,18 @@ class BiliAcceleratorCoreTest {
         val disguisedUrl = "https://edge-p2p-cache.example.com/upgcxcode/54/12/34567.m4s?os=mcdn"
         val explicitMcdnUrl = "https://xy1x2x3x4xy.mcdn.bilivideo.cn/upgcxcode/54/12/34567.m4s?os=mcdn"
 
-        // proxyMcdn=true 时，无论伪装还是显式 ?os=mcdn 均走官方 proxy-tf-all-* 中继代理
+        // 对齐上游 rewrite.js：仅显式 *.mcdn.* 域名走 proxy-tf-all-* 中继代理；非 *.mcdn.* 的 ?os=mcdn 绝不包裹代理，也不盲目换 UPOS
         val proxyCfg = defaultConfig.copy(proxyMcdn = true, mcdnStrategy = "proxy-all")
         val resDisguisedProxy = BiliAcceleratorCore.rewriteUrl(disguisedUrl, proxyCfg)
-        assertTrue("Disguised os=mcdn should proxy via proxy-tf-all when proxyMcdn=true", resDisguisedProxy.changed)
-        assertEquals("mcdn-proxy", resDisguisedProxy.reason)
-        assertTrue(resDisguisedProxy.finalUrl.startsWith("https://proxy-tf-all-ws.bilivideo.com/?url="))
+        assertFalse("Non-*.mcdn.* with ?os=mcdn must NOT wrap into proxy-tf-all-*", resDisguisedProxy.changed)
+        assertEquals("mcdn-relay-pass", resDisguisedProxy.reason)
+        assertTrue(resDisguisedProxy.isPcdn)
+        assertFalse(resDisguisedProxy.isMcdn)
+
+        val resExplicitProxy = BiliAcceleratorCore.rewriteUrl(explicitMcdnUrl, proxyCfg)
+        assertTrue("Explicit *.mcdn.* should proxy via proxy-tf-all when proxyMcdn=true", resExplicitProxy.changed)
+        assertEquals("mcdn-proxy", resExplicitProxy.reason)
+        assertTrue(resExplicitProxy.finalUrl.startsWith("https://proxy-tf-all-ws.bilivideo.com/?url="))
 
         // proxyMcdn=false 时，对齐 BTR #47：禁止将任何 ?os=mcdn / *.mcdn.* 中继签名跨节点替换到 upos-*（避免 100% 403）
         val cfg = defaultConfig.copy(proxyMcdn = false, blockPcdn = true, forceUpos = true, targetHost = "upos-sz-mirrorcos.bilivideo.com")
@@ -574,7 +580,7 @@ class BiliAcceleratorCoreTest {
     }
 
     @Test
-    fun testUnwrapSmtcdnsSupportsMultiSubdomainPortsAndIpv4() {
+    fun testUnwrapSmtcdnsSupportsMultiSubdomainPortsAndRejectsNonBilivideo() {
         val multiSub = "https://cdn-1.smtcdns.net/a.b.bilivideo.com:8443/live-bvc/123.m4s?token=1"
         assertEquals(
             "https://a.b.bilivideo.com:8443/live-bvc/123.m4s?token=1",
@@ -583,7 +589,7 @@ class BiliAcceleratorCoreTest {
 
         val ipv4Wrapped = "https://cdn-1.smtcdns.com/120.200.1.2:8080/live-bvc/123.flv"
         assertEquals(
-            "https://120.200.1.2:8080/live-bvc/123.flv",
+            "",
             BiliAcceleratorCore.unwrapSmtcdnsUrl(ipv4Wrapped)
         )
     }
@@ -995,12 +1001,14 @@ class BiliAcceleratorCoreTest {
             BiliAcceleratorCore.isCleanUposDonor("https://upos-sz-mirrorali.bilivideo.com/upgcxcode/12/34/56.m4s?os=mcdn")
         )
 
-        // 2. Disguised non-*.mcdn.* URL carrying ?os=mcdn routes through proxy-tf-all-ws when proxyMcdn=true (proxy-all)
+        // 2. Non-*.mcdn.* URL carrying ?os=mcdn (e.g. raw IP / mountaintoys.cn) must NOT wrap into proxy-tf-all-ws
         val disguisedOsMcdn = "https://112.34.56.78:8080/upgcxcode/12/34/56.m4s?os=mcdn&deadline=1900000000"
         val proxiedRes = BiliAcceleratorCore.rewriteUrl(disguisedOsMcdn, defaultConfig.copy(proxyMcdn = true, mcdnStrategy = "proxy-all"))
-        assertTrue(proxiedRes.changed)
-        assertEquals("mcdn-proxy", proxiedRes.reason)
-        assertTrue(proxiedRes.finalUrl.startsWith("https://proxy-tf-all-ws.bilivideo.com/?url="))
+        assertFalse(proxiedRes.changed)
+        assertEquals("mcdn-relay-pass", proxiedRes.reason)
+        assertTrue(proxiedRes.isPcdn)
+        assertFalse(proxiedRes.isMcdn)
+        assertEquals(disguisedOsMcdn, proxiedRes.finalUrl)
 
         // 3. forceUpos in filterAndFillBackupUrls must preserve original independently-signed backup URLs alongside targetHost
         val origHw = "https://upos-sz-mirrorhw.bilivideo.com/upgcxcode/12/34/56.m4s?sign=hw_only"
@@ -1044,5 +1052,223 @@ class BiliAcceleratorCoreTest {
         )
         assertTrue("Diagnostic report must normalize legacy replace strategy to proxy-all", diag.contains("策略: proxy-all"))
         assertFalse("Diagnostic report must not display removed replace strategy", diag.contains("策略: replace"))
+    }
+
+    @Test
+    fun testMountaintoysAndSzbdydClassificationAndSchedulerExtractionConsistency() {
+        val mountainUrl = "http://edge.mountaintoys.cn:8080/upgcxcode/54/12/34567.m4s?e=123&deadline=456&xy_usource=upos-tf-all-hw.bilivideo.com"
+        val szbdydUrl = "http://xy123.szbdyd.com:8080/upgcxcode/54/12/34567.m4s?e=123&deadline=456&xy_usource=upos-sz-mirrorali.bilivideo.com"
+
+        // 1. Both mountaintoys.cn and szbdyd.com (bare and subdomain) are consistently recognized as scheduler and P2P hosts
+        assertTrue(BiliAcceleratorCore.isSchedulerHost("edge.mountaintoys.cn"))
+        assertTrue(BiliAcceleratorCore.isSchedulerHost("mountaintoys.cn"))
+        assertTrue(BiliAcceleratorCore.isSchedulerHost("xy123.szbdyd.com"))
+        assertTrue(BiliAcceleratorCore.isSchedulerHost("szbdyd.com"))
+        assertTrue(BiliAcceleratorCore.isKnownP2pHost("edge.mountaintoys.cn:8080"))
+        assertTrue(BiliAcceleratorCore.isKnownP2pHost("mountaintoys.cn"))
+        assertTrue(BiliAcceleratorCore.isKnownP2pHost("xy123.szbdyd.com:8080"))
+
+        // 2. classify() produces kind="scheduler", isScheduler=true, isPcdn=true, isSlow=true, and schedulerSource for both
+        val mountainClass = BiliAcceleratorCore.classify(mountainUrl, defaultConfig)
+        assertNotNull(mountainClass)
+        assertEquals("scheduler", mountainClass!!.kind)
+        assertTrue(mountainClass.isScheduler)
+        assertTrue(mountainClass.isPcdn)
+        assertTrue(mountainClass.isSlow)
+        assertEquals("upos-tf-all-hw.bilivideo.com", mountainClass.schedulerSource)
+
+        val szbdydClass = BiliAcceleratorCore.classify(szbdydUrl, defaultConfig)
+        assertNotNull(szbdydClass)
+        assertEquals("scheduler", szbdydClass!!.kind)
+        assertTrue(szbdydClass.isScheduler)
+        assertTrue(szbdydClass.isPcdn)
+        assertTrue(szbdydClass.isSlow)
+        assertEquals("upos-sz-mirrorali.bilivideo.com", szbdydClass.schedulerSource)
+
+        // 3. extractSchedulerSourceHost & extractSchedulerSourceUrl recover clean HTTPS URLs for both
+        assertEquals("upos-tf-all-hw.bilivideo.com", BiliAcceleratorCore.extractSchedulerSourceHost(mountainUrl))
+        assertEquals(
+            "https://upos-tf-all-hw.bilivideo.com/upgcxcode/54/12/34567.m4s?e=123&deadline=456&xy_usource=upos-tf-all-hw.bilivideo.com",
+            BiliAcceleratorCore.extractSchedulerSourceUrl(mountainUrl)
+        )
+        assertEquals(
+            "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/34567.m4s?e=123&deadline=456&xy_usource=upos-sz-mirrorali.bilivideo.com",
+            BiliAcceleratorCore.extractSchedulerSourceUrl(szbdydUrl)
+        )
+
+        // 4. Rejects xy_usource extraction when carrying ?os=mcdn, /v1/resource/, or non-Bili malicious xy_usource
+        val mountainWithOsMcdn = "http://edge.mountaintoys.cn:8080/upgcxcode/54/12/34567.m4s?os=mcdn&xy_usource=upos-tf-all-hw.bilivideo.com"
+        assertNull(BiliAcceleratorCore.extractSchedulerSourceUrl(mountainWithOsMcdn))
+        val mountainWithEvilSource = "http://edge.mountaintoys.cn:8080/upgcxcode/54/12/34567.m4s?xy_usource=evil.example.com"
+        assertNull(BiliAcceleratorCore.extractSchedulerSourceUrl(mountainWithEvilSource))
+        val mountainNoSource = "http://edge.mountaintoys.cn:8080/upgcxcode/54/12/34567.m4s?deadline=456"
+        assertNull(BiliAcceleratorCore.extractSchedulerSourceUrl(mountainNoSource))
+
+        // Without valid xy_usource, mountaintoys.cn still falls back to PCDN block rewrite
+        val mountainPcdnFallback = BiliAcceleratorCore.rewriteUrl(mountainNoSource, defaultConfig)
+        assertTrue(mountainPcdnFallback.changed)
+        assertEquals("pcdn-host", mountainPcdnFallback.reason)
+        assertEquals(defaultConfig.targetHost, mountainPcdnFallback.targetHost)
+
+        // 5. normalizeSelectionMode consistency
+        assertEquals("auto", BiliAcceleratorCore.normalizeSelectionMode(null))
+        assertEquals("auto", BiliAcceleratorCore.normalizeSelectionMode("auto"))
+        assertEquals("manual", BiliAcceleratorCore.normalizeSelectionMode("manual"))
+        assertEquals("manual", BiliAcceleratorCore.normalizeSelectionMode("fixed"))
+    }
+
+    @Test
+    fun testNonMcdnOsMcdnNotWrappedByProxy() {
+        val mountainOsMcdn = "https://edge.mountaintoys.cn/upgcxcode/12/34/56.m4s?os=mcdn&deadline=1900000000"
+        val resMountain = BiliAcceleratorCore.rewriteUrl(mountainOsMcdn, defaultConfig.copy(proxyMcdn = true, mcdnStrategy = "proxy-all"))
+        assertFalse("mountaintoys.cn with ?os=mcdn must not be wrapped into proxy-tf-all-*", resMountain.changed)
+        assertEquals("mcdn-relay-pass", resMountain.reason)
+        assertTrue(resMountain.isPcdn)
+        assertFalse(resMountain.isMcdn)
+
+        val explicitMcdn = "https://xy1x2x3x4xy.mcdn.bilivideo.cn/upgcxcode/12/34/56.m4s?os=mcdn"
+        val resExplicit = BiliAcceleratorCore.rewriteUrl(explicitMcdn, defaultConfig.copy(proxyMcdn = true, mcdnStrategy = "proxy-all"))
+        assertTrue("Explicit *.mcdn.* must still be wrapped by MCDN proxy", resExplicit.changed)
+        assertEquals("mcdn-proxy", resExplicit.reason)
+        assertTrue(resExplicit.finalUrl.startsWith("https://proxy-tf-all-ws.bilivideo.com/?url="))
+    }
+
+    @Test
+    fun testIpv6HostParsingLoopbackAndDetection() {
+        assertEquals("240e:1234::1", BiliAcceleratorCore.stripPortFromHost("[240e:1234::1]:8080"))
+        assertEquals("240e:1234::1", BiliAcceleratorCore.stripPortFromHost("[240e:1234::1]"))
+        assertEquals("240e:1234::1", BiliAcceleratorCore.stripPortFromHost("240e:1234::1"))
+        assertEquals("upos-sz-mirrorcos.bilivideo.com", BiliAcceleratorCore.stripPortFromHost("upos-sz-mirrorcos.bilivideo.com:443"))
+        assertEquals("::1", BiliAcceleratorCore.normalizeHost("[::1]:18888"))
+        assertEquals(8080, BiliAcceleratorCore.extractPortFromHost("[240e:1234::1]:8080"))
+        assertEquals(-1, BiliAcceleratorCore.extractPortFromHost("[240e:1234::1]"))
+        assertEquals(443, BiliAcceleratorCore.extractPortFromHost("upos-sz-mirrorcos.bilivideo.com:443"))
+
+        assertTrue(BiliAcceleratorCore.isLoopbackHost("127.0.0.1:8080"))
+        assertTrue(BiliAcceleratorCore.isLoopbackHost("127.0.0.2"))
+        assertTrue(BiliAcceleratorCore.isLoopbackHost("localhost"))
+        assertTrue(BiliAcceleratorCore.isLoopbackHost("[::1]:18888"))
+        assertTrue(BiliAcceleratorCore.isLoopbackHost("::1"))
+        assertTrue(BiliAcceleratorCore.isLoopbackHost("[::ffff:127.0.0.1]:8080"))
+        assertTrue(BiliAcceleratorCore.isLoopbackHost("::ffff:7f00:1"))
+        assertTrue(BiliAcceleratorCore.isLoopbackHost("0:0:0:0:0:ffff:127.0.0.1"))
+        assertFalse(BiliAcceleratorCore.isLoopbackHost("[240e:1234::1]:8080"))
+
+        assertTrue(BiliAcceleratorCore.isIpAddress("[240e:1234::1]:8080"))
+        assertTrue(BiliAcceleratorCore.isIpAddress("240e:1234::1"))
+        assertTrue(BiliAcceleratorCore.isIpAddress("::ffff:127.0.0.1"))
+        assertTrue(BiliAcceleratorCore.isIpAddress("[::ffff:112.34.56.78]:8080"))
+        assertFalse(BiliAcceleratorCore.isIpAddress("::ffff:999.1.1.1"))
+        assertFalse(BiliAcceleratorCore.isIpAddress("[240e:1234::1"))
+        assertTrue(BiliAcceleratorCore.isSlowLiveHost("[240e:1234::1]:8080"))
+
+        // IPv6 loopback URL is recognized as already-local-proxy
+        val loopbackUrl = "http://[::1]:18888/upgcxcode/12/34/56.m4s"
+        val loopbackRes = BiliAcceleratorCore.rewriteUrl(loopbackUrl, defaultConfig)
+        assertFalse(loopbackRes.changed)
+        assertEquals("already-local-proxy", loopbackRes.reason)
+
+        // IPv6 PCDN URL is recognized as IP PCDN and rewritten to UPOS
+        val ipv6PcdnUrl = "http://[240e:1234::1]:8080/upgcxcode/12/34/56.m4s?deadline=1900000000"
+        val ipv6Class = BiliAcceleratorCore.classify(ipv6PcdnUrl, defaultConfig)
+        assertNotNull(ipv6Class)
+        assertTrue("IPv6 PCDN must be classified as isPcdn", ipv6Class!!.isPcdn)
+        assertTrue("IPv6 PCDN must be classified as isSlow", ipv6Class.isSlow)
+        val ipv6Rewrite = BiliAcceleratorCore.rewriteUrl(ipv6PcdnUrl, defaultConfig)
+        assertTrue("IPv6 PCDN must be rewritten to UPOS", ipv6Rewrite.changed)
+        assertEquals("pcdn-host", ipv6Rewrite.reason)
+        assertEquals(defaultConfig.targetHost, ipv6Rewrite.targetHost)
+    }
+
+    @Test
+    fun testCustomProxyHostAndCustomCdnPoolRejection() {
+        val customProxy = "relay-custom.bilivideo.com"
+        assertTrue("Official Bili custom proxy host without proxy-tf-all- prefix must be allowed", BiliAcceleratorCore.isValidProxyHost(customProxy))
+        assertTrue(BiliAcceleratorCore.isValidProxyHost("proxy-tf-all-ws.bilivideo.com"))
+        assertFalse(BiliAcceleratorCore.isValidProxyHost("evil.example.com"))
+        assertFalse(BiliAcceleratorCore.isValidProxyHost("xy1.mcdn.bilivideo.cn"))
+
+        // isValidCustomCdnHost must reject proxy-tf-all-*, proxy-*, and configured custom proxyHost
+        assertFalse(BiliAcceleratorCore.isValidCustomCdnHost("proxy-tf-all-ws.bilivideo.com"))
+        assertFalse(BiliAcceleratorCore.isValidCustomCdnHost("proxy-tf-all-tx.bilivideo.com"))
+        assertFalse(BiliAcceleratorCore.isValidCustomCdnHost("proxy-custom.bilivideo.com"))
+        assertFalse(BiliAcceleratorCore.isValidCustomCdnHost(customProxy, configuredProxyHost = customProxy))
+        assertTrue(BiliAcceleratorCore.isValidCustomCdnHost("upos-sz-mirrorcos.bilivideo.com", configuredProxyHost = customProxy))
+
+        val cfgWithCustomProxy = defaultConfig.copy(
+            proxyHost = customProxy,
+            customCdnPool = listOf(
+                "proxy-tf-all-ws.bilivideo.com",
+                customProxy,
+                "upos-sz-mirrorali.bilivideo.com"
+            )
+        )
+        assertEquals(listOf("upos-sz-mirrorali.bilivideo.com"), BiliAcceleratorCore.getEffectiveCdnPool(cfgWithCustomProxy))
+
+        val mcdnUrl = "https://xy1x2x3x4xy.mcdn.bilivideo.cn/upgcxcode/12/34/56.m4s?deadline=1899999999"
+        val wrappedRes = BiliAcceleratorCore.rewriteUrl(mcdnUrl, cfgWithCustomProxy)
+        assertTrue(wrappedRes.changed)
+        assertEquals("mcdn-proxy", wrappedRes.reason)
+        assertEquals(customProxy, wrappedRes.targetHost)
+        assertTrue(wrappedRes.finalUrl.startsWith("https://$customProxy/?url="))
+
+        // Already-proxied, isMediaUrl, isRelayUrl, extractUrlDeadlineSeconds all support custom proxyHost
+        val alreadyProxied = BiliAcceleratorCore.rewriteUrl(wrappedRes.finalUrl, cfgWithCustomProxy)
+        assertFalse(alreadyProxied.changed)
+        assertEquals("already-proxied", alreadyProxied.reason)
+        assertTrue(BiliAcceleratorCore.isMediaUrl(wrappedRes.finalUrl))
+        assertTrue(BiliAcceleratorCore.isRelayUrl(wrappedRes.finalUrl, customProxy))
+        assertEquals(1899999999L, BiliAcceleratorCore.extractUrlDeadlineSeconds(wrappedRes.finalUrl))
+    }
+
+    @Test
+    fun testXyMcdn443ClassifiedAsPcdnAndSlow() {
+        val xyMcdn443 = "https://xy1x2x3x4xy.mcdn.bilivideo.cn/upgcxcode/54/12/34567.m4s"
+        val verdict = BiliAcceleratorCore.classify(xyMcdn443, defaultConfig)
+        assertNotNull(verdict)
+        assertEquals("mcdn", verdict!!.kind)
+        assertTrue("xy...mcdn on 443 must have isMcdn=true", verdict.isMcdn)
+        assertTrue("xy...mcdn on 443 must have isPcdn=true", verdict.isPcdn)
+        assertTrue("xy...mcdn on 443 must have isSlow=true", verdict.isSlow)
+
+        val passRes = BiliAcceleratorCore.rewriteUrl(xyMcdn443, defaultConfig.copy(proxyMcdn = false))
+        assertFalse(passRes.changed)
+        assertEquals("mcdn-relay-pass", passRes.reason)
+        assertTrue("rewriteUrl must agree with classify on xy...mcdn isPcdn", passRes.isPcdn)
+        assertTrue(passRes.isMcdn)
+    }
+
+    @Test
+    fun testThirdPartyMediaUrlsRejectedByIsMediaUrlAndHasMediaSignal() {
+        val thirdPartyUrls = listOf(
+            "https://ads.example.com/splash/intro.mp4",
+            "https://cdn.thirdparty.net/promo/clip.m4s",
+            "https://static.adnetwork.org/video/banner.flv",
+            "https://stream.otherapp.io/hls/index.m3u8"
+        )
+        for (url in thirdPartyUrls) {
+            assertFalse("Third-party URL must not match hasMediaSignal: $url", BiliAcceleratorCore.hasMediaSignal(url))
+            assertFalse("Third-party URL must not match isMediaUrl: $url", BiliAcceleratorCore.isMediaUrl(url))
+        }
+
+        // Third-party ad URL spoofing bilivideo in query string must still be rejected by isMediaUrl & rewriteUrl
+        val spoofedAd = "https://ads.example.com/splash/intro.mp4?ref=bilivideo.com"
+        assertFalse("Query-spoofed third-party ad must be rejected by isMediaUrl", BiliAcceleratorCore.isMediaUrl(spoofedAd))
+        val spoofedRes = BiliAcceleratorCore.rewriteUrl(spoofedAd, defaultConfig.copy(forceUpos = true))
+        assertFalse(spoofedRes.changed)
+        assertEquals("ignored", spoofedRes.reason)
+
+        val biliUrls = listOf(
+            "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/12/34/56.m4s",
+            "https://i0.hdslb.com/bfs/archive/video.mp4",
+            "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/12/34/56.m4s",
+            "https://video-sea.bstarstatic.com/media/123.mp4",
+            "http://112.34.56.78:8080/upgcxcode/12/34/56.m4s",
+            "http://112.34.56.78:8080/live-bvc/123/live.flv"
+        )
+        for (url in biliUrls) {
+            assertTrue("Bilibili media URL must match hasMediaSignal: $url", BiliAcceleratorCore.hasMediaSignal(url))
+            assertTrue("Bilibili media URL must match isMediaUrl: $url", BiliAcceleratorCore.isMediaUrl(url))
+        }
     }
 }

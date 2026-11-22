@@ -135,6 +135,7 @@ fun SettingsScreen(
     if (showCustomCdnDialog) {
         CustomCdnPoolDialog(
             customPool = config.customCdnPool,
+            proxyHost = config.proxyHost,
             onSave = { newPool ->
                 onConfigChange(config.copy(customCdnPool = newPool))
                 showCustomCdnDialog = false
@@ -270,12 +271,14 @@ fun SettingsScreen(
                                     uposValues = uposValues
                                 )
 
+                                val isAutoVodMode = BiliAcceleratorCore.normalizeSelectionMode(config.selectionMode) == "auto"
+
                                 PreferenceDropdownItem(
                                     title = stringResource(R.string.label_target_host),
-                                    summary = if (config.enableBtr) {
-                                        "${config.targetHost}（启用 BTR 时由分片真实吞吐动态择优，不以 RTT 测速排序）"
-                                    } else {
-                                        config.targetHost
+                                    summary = when {
+                                        config.enableBtr -> "${config.targetHost}（启用 BTR 时由分片真实吞吐动态择优，不以 RTT 测速排序）"
+                                        isAutoVodMode -> "${config.targetHost}（非 BTR 智能路由：保留健康官方源，卡顿/低吞吐时 768KB 竞速达 1.5x 增益自动切源）"
+                                        else -> config.targetHost
                                     },
                                     selectedValue = currentUposLabel,
                                     onClick = { showUposDialog = true },
@@ -285,11 +288,28 @@ fun SettingsScreen(
                                 PreferenceDivider()
 
                                 PreferenceSwitchItem(
+                                    title = "非 BTR 智能点播路由与卡顿恢复",
+                                    summary = "关闭 BTR 时启用 Shaka 双半衰期吞吐监测与双候选 768KB Range 竞速，仅在获胜节点达到 1.5x 增益时平滑切源；关闭则固定使用首选 UPOS 镜像",
+                                    checked = isAutoVodMode,
+                                    onCheckedChange = { checked ->
+                                        onConfigChange(
+                                            config.copy(
+                                                selectionMode = if (checked) "auto" else "manual",
+                                                stallRecovery = checked
+                                            )
+                                        )
+                                    },
+                                    enabled = config.enabled && !config.enableBtr
+                                )
+
+                                PreferenceDivider()
+
+                                PreferenceSwitchItem(
                                     title = stringResource(R.string.label_force_upos),
                                     summary = stringResource(R.string.summary_force_upos),
                                     checked = config.forceUpos,
                                     onCheckedChange = { onConfigChange(config.copy(forceUpos = it)) },
-                                    enabled = config.enabled
+                                    enabled = config.enabled && (config.enableBtr || !isAutoVodMode)
                                 )
                             }
                         }
@@ -641,7 +661,7 @@ fun SettingsScreen(
 
                                 // 2. 并发 CDN 节点池 - 滑块调节
                                 var sliderPoolSize by remember(config.btrCdnPoolSize) {
-                                    mutableIntStateOf(config.btrCdnPoolSize.coerceIn(1, 16))
+                                    mutableIntStateOf(config.btrCdnPoolSize.coerceIn(1, 32))
                                 }
                                 val poolSummary = when (sliderPoolSize) {
                                     1 -> "1 个节点 · 仅单源拉取，不进行多源并发调度"
@@ -657,17 +677,17 @@ fun SettingsScreen(
                                     summary = poolSummary,
                                     value = sliderPoolSize.toFloat(),
                                     onValueChange = { newVal ->
-                                        sliderPoolSize = newVal.roundToInt().coerceIn(1, 16)
+                                        sliderPoolSize = newVal.roundToInt().coerceIn(1, 32)
                                     },
                                     onValueChangeFinished = {
                                         if (sliderPoolSize != config.btrCdnPoolSize) {
                                             onConfigChange(config.copy(btrCdnPoolSize = sliderPoolSize))
                                         }
                                     },
-                                    valueRange = 1f..16f,
-                                    steps = 14,
+                                    valueRange = 1f..32f,
+                                    steps = 30,
                                     showKeyPoints = true,
-                                    keyPoints = listOf(1f, 2f, 4f, 6f, 8f, 12f, 16f),
+                                    keyPoints = listOf(1f, 4f, 8f, 12f, 16f, 24f, 32f),
                                     valueLabel = "$sliderPoolSize 个节点",
                                     enabled = config.enabled && config.enableBtr
                                 )
@@ -821,6 +841,7 @@ private fun SingleChoiceDialog(
 @Composable
 private fun CustomCdnPoolDialog(
     customPool: List<String>,
+    proxyHost: String,
     onSave: (List<String>) -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -866,8 +887,8 @@ private fun CustomCdnPoolDialog(
                 val parsed = textValue.lines()
                     .map { it.trim() }
                     .filter { it.isNotEmpty() }
-                    .map { raw -> raw to BiliAcceleratorCore.cleanHost(raw).trim().lowercase().substringBefore(':') }
-                val invalid = parsed.filter { (_, host) -> !BiliAcceleratorCore.isValidCustomCdnHost(host) }
+                    .map { raw -> raw to BiliAcceleratorCore.normalizeHost(raw) }
+                val invalid = parsed.filter { (_, host) -> !BiliAcceleratorCore.isValidCustomCdnHost(host, proxyHost) }
                 if (invalid.isNotEmpty()) {
                     val preview = invalid.take(2).joinToString(", ") { it.first }
                     val suffix = if (invalid.size > 2) " 等 ${invalid.size} 项" else ""
@@ -1004,8 +1025,8 @@ private fun ProxyHostDialog(
                 val chosenHost = if (selectedPresetIndex in presets.indices) {
                     presets[selectedPresetIndex].first
                 } else {
-                    val cleaned = BiliAcceleratorCore.cleanHost(customHost).trim().lowercase().substringBefore(':')
-                    if (!BiliAcceleratorCore.isValidCustomCdnHost(cleaned)) {
+                    val cleaned = BiliAcceleratorCore.normalizeHost(customHost)
+                    if (!BiliAcceleratorCore.isValidProxyHost(cleaned)) {
                         validationError = "请输入有效的 B 站官方中继域名（如 proxy-tf-all-ws.bilivideo.com）"
                         return@TextButton
                     }

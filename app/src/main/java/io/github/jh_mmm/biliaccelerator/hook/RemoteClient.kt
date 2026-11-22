@@ -22,7 +22,7 @@ import io.github.jh_mmm.biliaccelerator.provider.XposedServiceProvider
 import io.github.jh_mmm.biliaccelerator.receiver.StatsReceiver
 import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedModule
-import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
@@ -50,10 +50,12 @@ object RemoteClient {
     private val isFetching = AtomicBoolean(false)
     private const val CONFIG_CACHE_TTL = 30_000L
 
-    private val pendingBatch = ConcurrentLinkedQueue<RewriteResult>()
+    private val pendingBatch = ConcurrentLinkedDeque<RewriteResult>()
     private const val BATCH_MAX_SIZE = 10
     private const val FLUSH_INTERVAL_MS = 1500L
     private var pendingFlushFuture: ScheduledFuture<*>? = null
+    private var isImmediateFlushScheduled = false
+    private val isFlushing = AtomicBoolean(false)
     private val flushLock = Any()
     private val lastBroadcastTime = AtomicLong(0L)
 
@@ -72,8 +74,19 @@ object RemoteClient {
 
     fun getCachedConfig(): AcceleratorConfig = cachedConfig
 
+    internal fun normalizeConfig(config: AcceleratorConfig): AcceleratorConfig {
+        return BiliAcceleratorCore.normalizeConfig(config)
+    }
+
+    internal fun parseConfigJson(json: String?): AcceleratorConfig? {
+        if (json.isNullOrBlank()) return null
+        return runCatching {
+            gson.fromJson(json, AcceleratorConfig::class.java)?.let { normalizeConfig(it) }
+        }.getOrNull()
+    }
+
     internal fun setCachedConfigForTesting(config: AcceleratorConfig, fetchTimeMs: Long = System.currentTimeMillis()) {
-        cachedConfig = config
+        cachedConfig = normalizeConfig(config)
         lastConfigFetchTime.set(fetchTimeMs)
     }
 
@@ -100,8 +113,8 @@ object RemoteClient {
         try {
             val json = prefs.getString(XposedServiceProvider.KEY_REMOTE_CONFIG_JSON, null)
             if (!json.isNullOrBlank()) {
-                val cfg = gson.fromJson(json, AcceleratorConfig::class.java) ?: return
-                cachedConfig = cfg.copy(mcdnStrategy = BiliAcceleratorCore.normalizeMcdnStrategy(cfg.mcdnStrategy))
+                val cfg = parseConfigJson(json) ?: return
+                cachedConfig = cfg
                 lastConfigFetchTime.set(System.currentTimeMillis())
                 appContext?.let { saveConfigToLocalCache(it, cfg) }
                 syncBtrProxyState(cfg)
@@ -124,8 +137,9 @@ object RemoteClient {
             return
         }
 
-        // 初始化跨进程共享状态目录（Playinfo 元数据与跨会话并发持久化）
+        // 初始化跨进程共享状态目录与跨进程 Playinfo 刷新桥接（Playinfo 元数据与跨会话并发持久化）
         PlayinfoRegistry.configureSharedStateDir(runCatching { app.noBackupFilesDir ?: app.cacheDir }.getOrNull())
+        PlayinfoRegistry.attachAppContext(app)
 
         // 从目标 App 私有目录载入历史持久化配置，若未从 RemotePreferences 同步到则使用本地缓存
         if (lastConfigFetchTime.get() == 0L) {
@@ -243,8 +257,8 @@ object RemoteClient {
                     if (!authorized) return
 
                     val json = intent.getStringExtra(StatsProvider.EXTRA_CONFIG_JSON) ?: return
-                    val newConfig = runCatching { gson.fromJson(json, AcceleratorConfig::class.java) }.getOrNull() ?: return
-                    cachedConfig = newConfig.copy(mcdnStrategy = BiliAcceleratorCore.normalizeMcdnStrategy(newConfig.mcdnStrategy))
+                    val newConfig = parseConfigJson(json) ?: return
+                    cachedConfig = newConfig
                     lastConfigFetchTime.set(System.currentTimeMillis())
                     saveConfigToLocalCache(context, newConfig)
                     syncBtrProxyState(newConfig)
@@ -299,15 +313,19 @@ object RemoteClient {
         }
     }
 
-    private fun loadConfigFromLocalCache(context: Context) {
+    internal fun loadConfigFromLocalCache(context: Context) {
         try {
             val sp = context.getSharedPreferences(TARGET_PREFS_NAME, Context.MODE_PRIVATE)
             val json = sp.getString(KEY_CACHED_CONFIG, null)
             if (!json.isNullOrEmpty()) {
-                val saved = gson.fromJson(json, AcceleratorConfig::class.java)
-                if (saved != null) {
-                    cachedConfig = saved
-                    Log.i(TAG, "Loaded cached config from local target app storage: targetHost=${saved.targetHost}")
+                val rawSaved = gson.fromJson(json, AcceleratorConfig::class.java)
+                if (rawSaved != null) {
+                    val normalized = normalizeConfig(rawSaved)
+                    cachedConfig = normalized
+                    if (normalized != rawSaved) {
+                        saveConfigToLocalCache(context, normalized)
+                    }
+                    Log.i(TAG, "Loaded cached config from local target app storage: targetHost=${normalized.targetHost}")
                 }
             }
         } catch (t: Throwable) {
@@ -315,10 +333,11 @@ object RemoteClient {
         }
     }
 
-    private fun saveConfigToLocalCache(context: Context, config: AcceleratorConfig) {
+    internal fun saveConfigToLocalCache(context: Context, config: AcceleratorConfig) {
         try {
+            val normalized = normalizeConfig(config)
             val sp = context.getSharedPreferences(TARGET_PREFS_NAME, Context.MODE_PRIVATE)
-            sp.edit().putString(KEY_CACHED_CONFIG, gson.toJson(config)).apply()
+            sp.edit().putString(KEY_CACHED_CONFIG, gson.toJson(normalized)).apply()
         } catch (_: Throwable) {}
     }
 
@@ -362,7 +381,7 @@ object RemoteClient {
         return cachedConfig
     }
 
-    private fun fetchConfigDirect(context: Context): AcceleratorConfig? {
+    internal fun fetchConfigDirect(context: Context): AcceleratorConfig? {
         return try {
             val response = context.contentResolver.call(
                 StatsProvider.CONTENT_URI,
@@ -371,9 +390,7 @@ object RemoteClient {
                 null
             )
             val json = response?.getString(StatsProvider.EXTRA_CONFIG_JSON)
-            if (!json.isNullOrEmpty()) {
-                gson.fromJson(json, AcceleratorConfig::class.java)
-            } else null
+            parseConfigJson(json)
         } catch (t: Throwable) {
             Log.d(TAG, "Direct config fetch failed: ${t.message}")
             null
@@ -508,16 +525,35 @@ object RemoteClient {
     fun notifyRewrite(result: RewriteResult) {
         pendingBatch.offer(sanitizeForIpc(result))
 
-        if (pendingBatch.size >= BATCH_MAX_SIZE) {
-            reportScheduler.execute { flushBatch() }
-        } else {
-            synchronized(flushLock) {
+        synchronized(flushLock) {
+            if (pendingBatch.size >= BATCH_MAX_SIZE) {
+                // 修复 Bug B：原子取消并清空既有延迟任务，防止已排队的延迟任务在未来重复触发
                 pendingFlushFuture?.cancel(false)
-                pendingFlushFuture = reportScheduler.schedule({
-                    flushBatch()
-                }, FLUSH_INTERVAL_MS, TimeUnit.MILLISECONDS)
+                pendingFlushFuture = null
+                if (!isImmediateFlushScheduled) {
+                    isImmediateFlushScheduled = true
+                    reportScheduler.execute {
+                        runFlushBatch()
+                    }
+                }
+            } else {
+                // 队列尚未达批次上限，执行防抖延迟合并；若已有即时任务排队则由即时任务一并批处理
+                if (!isImmediateFlushScheduled) {
+                    pendingFlushFuture?.cancel(false)
+                    pendingFlushFuture = reportScheduler.schedule({
+                        runFlushBatch()
+                    }, FLUSH_INTERVAL_MS, TimeUnit.MILLISECONDS)
+                }
             }
         }
+    }
+
+    private fun runFlushBatch() {
+        synchronized(flushLock) {
+            isImmediateFlushScheduled = false
+            pendingFlushFuture = null
+        }
+        flushBatch()
     }
 
     internal fun sanitizeForIpc(result: RewriteResult): RewriteResult {
@@ -544,102 +580,189 @@ object RemoteClient {
     }
 
     private fun flushBatch() {
-        val batch = mutableListOf<RewriteResult>()
-        while (batch.size < 50) {
-            val item = pendingBatch.poll() ?: break
-            batch.add(sanitizeForIpc(item))
-        }
-        if (batch.isEmpty()) return
-
-        val context = getContext()
-        if (context == null) {
-            Log.w(TAG, "统计批量上报跳过：目标进程 Context 为空 (丢弃 ${batch.size} 条)")
+        if (!isFlushing.compareAndSet(false, true)) {
             return
         }
-
-        val json = gson.toJson(batch)
-        val currentHooks = HookStatusTracker.getSnapshot()
-        val dirtyHooksJson = if (currentHooks.isNotEmpty() && currentHooks != lastSyncedHookStatus) {
-            gson.toJson(currentHooks)
-        } else null
-        var reported = false
-
-        // 1. 优先尝试 ContentProvider 批量 IPC
+        var rateLimitRetried = false
         try {
-            val extras = Bundle().apply {
-                putString(StatsProvider.EXTRA_REWRITE_BATCH_JSON, json)
-                if (dirtyHooksJson != null) {
-                    putString(StatsProvider.EXTRA_HOOK_STATUS_JSON, dirtyHooksJson)
-                }
+            val batch = mutableListOf<RewriteResult>()
+            while (batch.size < 50) {
+                val item = pendingBatch.poll() ?: break
+                batch.add(sanitizeForIpc(item))
             }
-            val response = context.contentResolver.call(
-                StatsProvider.CONTENT_URI,
-                StatsProvider.METHOD_RECORD_BATCH_REWRITE,
-                null,
-                extras
-            )
-            if (response?.getBoolean(StatsProvider.EXTRA_SUCCESS) == true) {
-                reported = true
-                if (dirtyHooksJson != null) {
-                    lastSyncedHookStatus = currentHooks
-                }
-                Log.i(TAG, "[Provider] 批量上报成功 (${batch.size} 条重定向)")
+            if (batch.isEmpty()) return
+
+            val context = getContext()
+            if (context == null) {
+                Log.w(TAG, "统计批量上报跳过：目标进程 Context 为空 (丢弃 ${batch.size} 条)")
+                return
             }
-        } catch (t: Throwable) {
-            Log.d(TAG, "[Provider] 暂不可达: ${t.javaClass.simpleName} (${t.message})")
-        }
 
-        // 2. 兜底通道：发送带鉴权 Token 的显式广播，附带限流防止广播风暴（1.0.5 经典双通道）
-        if (!reported) {
-            val now = System.currentTimeMillis()
-            val timeSinceLastBroadcast = now - lastBroadcastTime.get()
-            if (timeSinceLastBroadcast >= 1000L) {
-                lastBroadcastTime.set(now)
-                try {
-                    val authIntent = Intent().apply {
-                        setPackage(context.packageName)
-                    }
-                    val authToken = PendingIntent.getBroadcast(
-                        context,
-                        0,
-                        authIntent,
-                        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-                    )
+            val json = gson.toJson(batch)
+            val currentHooks = HookStatusTracker.getSnapshot()
+            val dirtyHooksJson = if (currentHooks.isNotEmpty() && currentHooks != lastSyncedHookStatus) {
+                gson.toJson(currentHooks)
+            } else null
+            var reported = false
 
-                    val procName = resolveProcessName(context) ?: context.packageName
-                    val intent = Intent(StatsReceiver.ACTION_RECORD_REWRITE).apply {
-                        setPackage(BiliAcceleratorCore.MODULE_PACKAGE)
-                        addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
-                        putExtra(StatsReceiver.EXTRA_REWRITE_BATCH_JSON, json)
-                        putExtra(StatsReceiver.EXTRA_AUTH_TOKEN, authToken)
-                        putExtra(StatsReceiver.EXTRA_CLIENT_PACKAGE, context.packageName)
-                        putExtra(StatsReceiver.EXTRA_CLIENT_PROCESS, procName)
-                        if (dirtyHooksJson != null) {
-                            putExtra(StatsReceiver.EXTRA_HOOK_STATUS_JSON, dirtyHooksJson)
-                        }
+            // 1. 优先尝试 ContentProvider 批量 IPC
+            try {
+                val extras = Bundle().apply {
+                    putString(StatsProvider.EXTRA_REWRITE_BATCH_JSON, json)
+                    if (dirtyHooksJson != null) {
+                        putString(StatsProvider.EXTRA_HOOK_STATUS_JSON, dirtyHooksJson)
                     }
-                    context.sendBroadcast(intent)
+                }
+                val response = context.contentResolver.call(
+                    StatsProvider.CONTENT_URI,
+                    StatsProvider.METHOD_RECORD_BATCH_REWRITE,
+                    null,
+                    extras
+                )
+                if (response?.getBoolean(StatsProvider.EXTRA_SUCCESS) == true) {
+                    reported = true
                     if (dirtyHooksJson != null) {
                         lastSyncedHookStatus = currentHooks
                     }
-                    Log.i(TAG, "[Broadcast] 备用通道批量发送成功 (${batch.size} 条重定向)")
-                } catch (t: Throwable) {
-                    Log.w(TAG, "[Broadcast] 发送异常: $t")
+                    Log.i(TAG, "[Provider] 批量上报成功 (${batch.size} 条重定向)")
                 }
-            } else {
-                // 修复丢包缺陷：将尚未发送的批次数据重新回填到队列头部，并安排延迟重试
-                for (item in batch) {
-                    pendingBatch.offer(item)
-                }
-                val retryDelay = maxOf(100L, 1000L - timeSinceLastBroadcast)
-                synchronized(flushLock) {
-                    pendingFlushFuture?.cancel(false)
-                    pendingFlushFuture = reportScheduler.schedule({
-                        flushBatch()
-                    }, retryDelay, TimeUnit.MILLISECONDS)
-                }
-                Log.d(TAG, "[Broadcast] 广播限流保护触发，已回填 ${batch.size} 条数据并将于 ${retryDelay}ms 后重试")
+            } catch (t: Throwable) {
+                Log.d(TAG, "[Provider] 暂不可达: ${t.javaClass.simpleName} (${t.message})")
             }
+
+            // 2. 兜底通道：发送带鉴权 Token 的显式广播，附带限流防止广播风暴（1.0.5 经典双通道）
+            if (!reported) {
+                val now = System.currentTimeMillis()
+                val timeSinceLastBroadcast = now - lastBroadcastTime.get()
+                if (timeSinceLastBroadcast >= 1000L) {
+                    lastBroadcastTime.set(now)
+                    try {
+                        val authIntent = Intent().apply {
+                            setPackage(context.packageName)
+                        }
+                        val authToken = PendingIntent.getBroadcast(
+                            context,
+                            0,
+                            authIntent,
+                            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                        )
+
+                        val procName = resolveProcessName(context) ?: context.packageName
+                        val intent = Intent(StatsReceiver.ACTION_RECORD_REWRITE).apply {
+                            setPackage(BiliAcceleratorCore.MODULE_PACKAGE)
+                            addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
+                            putExtra(StatsReceiver.EXTRA_REWRITE_BATCH_JSON, json)
+                            putExtra(StatsReceiver.EXTRA_AUTH_TOKEN, authToken)
+                            putExtra(StatsReceiver.EXTRA_CLIENT_PACKAGE, context.packageName)
+                            putExtra(StatsReceiver.EXTRA_CLIENT_PROCESS, procName)
+                            if (dirtyHooksJson != null) {
+                                putExtra(StatsReceiver.EXTRA_HOOK_STATUS_JSON, dirtyHooksJson)
+                            }
+                        }
+                        context.sendBroadcast(intent)
+                        if (dirtyHooksJson != null) {
+                            lastSyncedHookStatus = currentHooks
+                        }
+                        Log.i(TAG, "[Broadcast] 备用通道批量发送成功 (${batch.size} 条重定向)")
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "[Broadcast] 发送异常: $t")
+                    }
+                } else {
+                    rateLimitRetried = true
+                    // 修复 Bug A：将尚未发送的批次数据以倒序重新回填到队列头部（addFirst），保持原有的时间戳与FIFO顺序
+                    reenqueueBatchAtHead(batch)
+                    val retryDelay = maxOf(100L, 1000L - timeSinceLastBroadcast)
+                    synchronized(flushLock) {
+                        isImmediateFlushScheduled = false
+                        pendingFlushFuture?.cancel(false)
+                        pendingFlushFuture = reportScheduler.schedule({
+                            runFlushBatch()
+                        }, retryDelay, TimeUnit.MILLISECONDS)
+                    }
+                    Log.d(TAG, "[Broadcast] 广播限流保护触发，已回填 ${batch.size} 条数据并将于 ${retryDelay}ms 后重试")
+                }
+            }
+        } finally {
+            isFlushing.set(false)
+            if (!rateLimitRetried && pendingBatch.isNotEmpty()) {
+                synchronized(flushLock) {
+                    if (pendingBatch.size >= BATCH_MAX_SIZE) {
+                        pendingFlushFuture?.cancel(false)
+                        pendingFlushFuture = null
+                        if (!isImmediateFlushScheduled) {
+                            isImmediateFlushScheduled = true
+                            reportScheduler.execute { runFlushBatch() }
+                        }
+                    } else if (pendingFlushFuture == null || pendingFlushFuture?.isDone == true) {
+                        pendingFlushFuture = reportScheduler.schedule({
+                            runFlushBatch()
+                        }, FLUSH_INTERVAL_MS, TimeUnit.MILLISECONDS)
+                    }
+                }
+            }
+        }
+    }
+
+    internal fun reenqueueBatchAtHead(batch: List<RewriteResult>) {
+        for (item in batch.asReversed()) {
+            pendingBatch.addFirst(item)
+        }
+    }
+
+    internal fun getPendingBatchForTesting(): List<RewriteResult> = pendingBatch.toList()
+
+    internal fun clearPendingBatchForTesting() {
+        pendingBatch.clear()
+    }
+
+    internal fun setAppContextForTesting(context: Context?) {
+        appContext = context
+    }
+
+    internal fun setLastBroadcastTimeForTesting(timeMs: Long) {
+        lastBroadcastTime.set(timeMs)
+    }
+
+    internal fun getLastBroadcastTimeForTesting(): Long = lastBroadcastTime.get()
+
+    internal fun getPendingFlushFutureForTesting(): ScheduledFuture<*>? = synchronized(flushLock) { pendingFlushFuture }
+
+    internal fun isImmediateFlushScheduledForTesting(): Boolean = synchronized(flushLock) { isImmediateFlushScheduled }
+
+    internal fun isFlushingForTesting(): Boolean = isFlushing.get()
+
+    internal fun flushBatchDirectForTesting() {
+        flushBatch()
+    }
+
+    internal fun addPendingBatchForTesting(item: RewriteResult) {
+        pendingBatch.offer(sanitizeForIpc(item))
+    }
+
+    internal fun resetFlushStateForTesting() {
+        synchronized(flushLock) {
+            pendingFlushFuture?.cancel(false)
+            pendingFlushFuture = null
+            isImmediateFlushScheduled = false
+        }
+        isFlushing.set(false)
+        pendingBatch.clear()
+        lastBroadcastTime.set(0L)
+        appContext = null
+    }
+
+    internal fun awaitReportSchedulerForTesting(timeoutMs: Long = 2000L) {
+        val future = reportScheduler.submit { }
+        future.get(timeoutMs, TimeUnit.MILLISECONDS)
+    }
+
+    internal fun pauseReportSchedulerForTesting(
+        started: java.util.concurrent.CountDownLatch,
+        release: java.util.concurrent.CountDownLatch
+    ) {
+        reportScheduler.execute {
+            started.countDown()
+            runCatching { release.await(5, TimeUnit.SECONDS) }
         }
     }
 }

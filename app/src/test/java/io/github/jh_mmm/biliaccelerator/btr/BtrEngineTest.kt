@@ -66,8 +66,26 @@ class BtrEngineTest {
     @Test
     fun testSynthesizeCompatibleBackupsForOverseasAkamai() {
         val akamaiPrimary = "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/54/12/12345.m4s?deadline=1700000000"
-        val backups = BtrSessionManager.synthesizeCompatibleBackups(akamaiPrimary)
-        assertTrue("Overseas Akamai stream should synthesize compatible mirrors", backups.isNotEmpty())
+        // Issue 11: 默认（rewriteAkamai=false / allowAkamaiDonor=false）不得将 Akamai（即便无 hdnts=）镜像到 UPOS
+        assertTrue(
+            "Akamai host without allowAkamaiDonor must NOT synthesize UPOS mirrors",
+            BtrSessionManager.synthesizeCompatibleBackups(akamaiPrimary).isEmpty()
+        )
+        assertTrue(
+            "Akamai host with rewriteAkamai=false must NOT synthesize UPOS mirrors",
+            BtrSessionManager.synthesizeCompatibleBackups(
+                akamaiPrimary,
+                AcceleratorConfig(enableBtr = true, rewriteAkamai = false),
+                allowAkamaiDonor = true
+            ).isEmpty()
+        )
+        // 显式开启 rewriteAkamai=true + enableBtr=true 且 allowAkamaiDonor=true 时允许合成兼容 UPOS 镜像
+        val backups = BtrSessionManager.synthesizeCompatibleBackups(
+            akamaiPrimary,
+            AcceleratorConfig(enableBtr = true, rewriteAkamai = true),
+            allowAkamaiDonor = true
+        )
+        assertTrue("Overseas Akamai stream with rewriteAkamai+BTR should synthesize compatible mirrors", backups.isNotEmpty())
         assertTrue("Synthesized mirrors should prioritize overseas ov nodes", backups.any { it.contains("ov.bilivideo.com") })
         for (backup in backups) {
             assertFalse("Must exclude Akamai hosts", backup.contains("akamaized.net") || backup.contains("mirrorakam"))
@@ -603,15 +621,21 @@ class BtrEngineTest {
         )
         assertEquals(6, controller.currentConcurrency)
 
-        // 第一个 1500ms 周期记录基准吞吐并上探试跑 8，第二个 1500ms 周期确认增益 >= 8% 并保留 8
+        // 无需求压力时（未采集到队列饱和指标）严禁盲目升档
         controller.recordProgress(1024 * 1024L, nowMs = t)
         t += 1_500L
         controller.recordProgress(4 * 1024 * 1024L, nowMs = t)
-        assertEquals("Should probe up from 6 to 8", 8, controller.currentConcurrency)
+        assertEquals("Must NOT step up without genuine demand pressure", 6, controller.currentConcurrency)
 
+        // 存在持续队列饱和压力时上探试跑 8，5 秒试探窗口内吞吐增益 >= 8% 时保留 8
+        controller.recordDemand(active = 6, limit = 6, queued = 4, nowMs = t)
         t += 1_500L
-        controller.recordProgress(6 * 1024 * 1024L, nowMs = t)
-        assertEquals("Should commit 8 after >8% throughput gain", 8, controller.currentConcurrency)
+        controller.recordProgress(4 * 1024 * 1024L, nowMs = t)
+        assertEquals("Should probe up from 6 to 8 under sustained saturation", 8, controller.currentConcurrency)
+
+        t += 5_500L
+        controller.recordProgress(20 * 1024 * 1024L, nowMs = t)
+        assertEquals("Should commit 8 after >=8% throughput gain", 8, controller.currentConcurrency)
 
         // 模拟上游返回 HTTP 429 Pushback -> 立即降档并进入冷却
         val steppedDown = controller.onPushback(nowMs = t + 100L)
@@ -1004,13 +1028,21 @@ class BtrEngineTest {
 
         val sid = BtrSessionManager.register(primaryUrl = nearExpiryUrl, config = null)
         try {
+            val session = BtrSessionManager.get(sid)!!
+            session.proactiveRefreshTask?.cancel(false)
             BtrSessionManager.attachRefreshProvider(sid) {
                 attempts.incrementAndGet()
                 false
             }
-            val session = BtrSessionManager.get(sid)!!
-            // Cancel any async timer race before deterministic calls
+            // Cancel any async 0ms timer race and wait for any in-flight default/attached timer before deterministic calls
             session.proactiveRefreshTask?.cancel(false)
+            val spinDeadline = System.currentTimeMillis() + 500L
+            while (session.refreshInFlight.get() && System.currentTimeMillis() < spinDeadline) {
+                Thread.sleep(5L)
+            }
+            attempts.set(0)
+            session.nextRefreshAllowedAtMs = 0L
+            session.refreshConsecutiveFailures.set(0)
 
             val firstFail = BtrSessionManager.maybeTriggerProactiveRefresh(session, nowMs = nowMs)
             assertFalse(firstFail)
@@ -1028,6 +1060,7 @@ class BtrEngineTest {
                 BtrSessionManager.refreshSignatureIfSamePath(freshUrl, emptyList())
                 true
             }
+            session.proactiveRefreshTask?.cancel(false)
             val recovered = BtrSessionManager.maybeTriggerProactiveRefresh(session, nowMs = nowMs + 50_000L)
             assertTrue("Proactive refresh must succeed once cooldown passes", recovered)
             assertEquals(freshUrl, session.primaryUrl)
@@ -1232,13 +1265,17 @@ class BtrEngineTest {
 
     @Test
     fun testBtrChunkEngineUncached416Malformed200SequentialFailoverTrialAndChunkTaskPrefix() {
-        // 1. shouldAllowUnmeasuredTrial periodic exploration (protects startup chunks 0..5)
-        assertFalse(BtrChunkEngine.shouldAllowUnmeasuredTrial(0L, 1000L))
-        assertFalse(BtrChunkEngine.shouldAllowUnmeasuredTrial(1L, 1000L))
-        assertFalse(BtrChunkEngine.shouldAllowUnmeasuredTrial(2L, 1000L))
-        assertTrue(BtrChunkEngine.shouldAllowUnmeasuredTrial(8L, 1000L))
-        assertFalse(BtrChunkEngine.shouldAllowUnmeasuredTrial(3L, 1000L))
-        assertTrue(BtrChunkEngine.shouldAllowUnmeasuredTrial(997L, 1000L))
+        // 1. shouldAllowUnmeasuredTrial warmup (measuredCount < 6) & steady-state (measuredCount >= 6) exploration
+        assertFalse("Chunk 0 must always use proven node", BtrChunkEngine.shouldAllowUnmeasuredTrial(0L, 1000L, measuredCount = 1, unmeasuredCount = 6))
+        assertTrue("Warmup must probe unmeasured nodes early on chunk 1", BtrChunkEngine.shouldAllowUnmeasuredTrial(1L, 1000L, measuredCount = 1, unmeasuredCount = 6))
+        assertFalse("Warmup protects every 3rd chunk (0, 3, 6) on proven nodes", BtrChunkEngine.shouldAllowUnmeasuredTrial(3L, 1000L, measuredCount = 1, unmeasuredCount = 6))
+        // Steady-state (measuredCount >= 6): protects chunks 1..3, explores every 4th chunk + tail quota
+        assertFalse(BtrChunkEngine.shouldAllowUnmeasuredTrial(0L, 1000L, measuredCount = 6, unmeasuredCount = 2))
+        assertFalse(BtrChunkEngine.shouldAllowUnmeasuredTrial(1L, 1000L, measuredCount = 6, unmeasuredCount = 2))
+        assertFalse(BtrChunkEngine.shouldAllowUnmeasuredTrial(2L, 1000L, measuredCount = 6, unmeasuredCount = 2))
+        assertFalse(BtrChunkEngine.shouldAllowUnmeasuredTrial(3L, 1000L, measuredCount = 6, unmeasuredCount = 2))
+        assertTrue(BtrChunkEngine.shouldAllowUnmeasuredTrial(8L, 1000L, measuredCount = 6, unmeasuredCount = 2))
+        assertTrue(BtrChunkEngine.shouldAllowUnmeasuredTrial(997L, 1000L, measuredCount = 6, unmeasuredCount = 2))
 
         // 2. HTTP 200 with Content-Range rejected by isValidContentRange
         val dummySession = BtrMediaSession("s1", "https://upos-sz-mirrorcos.bilivideo.com/a.m4s", emptyList(), null)
@@ -1391,23 +1428,22 @@ class BtrEngineTest {
 
     @Test
     fun testLiveUnwrapGenericHostsRedirectBaseUrlIframeKeyAndDynamicHostProbe() {
-        // 1. Generic unwrapProxyUrl (hostname, IPv4, IPv6, rejects version paths / invalid ports)
+        // 1. Strict unwrapProxyUrl (Issue 14: strictly *.bilivideo.(com|cn|net), rejects third-party/IP/version paths/invalid ports)
         assertEquals(
-            "https://cdn.example.org:8443/live-bvc/room.flv?token=1",
-            BtrLiveCore.unwrapProxyUrl("https://proxy.smtcdns.net/cdn.example.org:8443/live-bvc/room.flv?token=1")
+            "https://d1--cn-gotcha208.bilivideo.com:8443/live-bvc/room.flv?token=1",
+            BtrLiveCore.unwrapProxyUrl("https://proxy.smtcdns.net/d1--cn-gotcha208.bilivideo.com:8443/live-bvc/room.flv?token=1")
         )
         assertEquals(
-            "http://1.2.3.4:8080/live-bvc/room.m4s",
-            BtrLiveCore.unwrapProxyUrl("http://proxy.smtcdns.com/1.2.3.4:8080/live-bvc/room.m4s")
+            "https://d1--cn-gotcha204.bilivideo.cn/live-bvc/room.m4s",
+            BtrLiveCore.unwrapProxyUrl("https://proxy.smtcdns.com/d1--cn-gotcha204.bilivideo.cn/live-bvc/room.m4s")
         )
-        assertEquals(
-            "https://[2408:871a:10::1]:443/live-bvc/room.m4s",
-            BtrLiveCore.unwrapProxyUrl("https://proxy.smtcdns.net/[2408:871a:10::1]:443/live-bvc/room.m4s")
-        )
+        assertEquals("", BtrLiveCore.unwrapProxyUrl("https://proxy.smtcdns.net/cdn.example.org:8443/live-bvc/room.flv?token=1"))
+        assertEquals("", BtrLiveCore.unwrapProxyUrl("http://proxy.smtcdns.com/1.2.3.4:8080/live-bvc/room.m4s"))
+        assertEquals("", BtrLiveCore.unwrapProxyUrl("https://proxy.smtcdns.net/[2408:871a:10::1]:443/live-bvc/room.m4s"))
         assertEquals("", BtrLiveCore.unwrapProxyUrl("https://proxy.smtcdns.net/v1.0/live/room.m4s"))
         assertEquals("", BtrLiveCore.unwrapProxyUrl("https://proxy.smtcdns.net/api.v2/live/room.m4s"))
         assertEquals("", BtrLiveCore.unwrapProxyUrl("https://proxy.smtcdns.net/999.0.0.1/live/room.m4s"))
-        assertEquals("", BtrLiveCore.unwrapProxyUrl("https://proxy.smtcdns.net/cdn.example.org:99999/live.m4s"))
+        assertEquals("", BtrLiveCore.unwrapProxyUrl("https://proxy.smtcdns.net/d1--cn-gotcha204.bilivideo.com:99999/live.m4s"))
 
         // 2. #EXT-X-I-FRAME-STREAM-INF in master playlist & #EXT-X-KEY in media playlist
         val master = """
@@ -2111,13 +2147,17 @@ class BtrEngineTest {
     }
 
     @Test
-    fun testLiveSwapHostPreservesEncodedAuthParamsAndDomesticPoolOnly() {
-        assertFalse(
-            "Live default FMP4 pool must not contain overseas ov-gotcha hosts",
-            BtrLiveCore.KNOWN_FMP4_HOSTS.any { it.contains("ov-gotcha", ignoreCase = true) }
-        )
+    fun testLiveSwapHostPreservesEncodedAuthParamsAndKnownFmp4Pool() {
         assertTrue(BtrLiveCore.KNOWN_FMP4_HOSTS.contains("d1--cn-gotcha204.bilivideo.com"))
         assertTrue(BtrLiveCore.KNOWN_FMP4_HOSTS.contains("d1--cn-gotcha208.bilivideo.com"))
+        assertTrue(
+            "Live FMP4 pool must include overseas ov-gotcha208 host (Issue I-2)",
+            BtrLiveCore.KNOWN_FMP4_HOSTS.contains("d1--ov-gotcha208.bilivideo.com")
+        )
+        assertTrue(
+            "Live FMP4 pool must include overseas ov-gotcha208b host (Issue I-2)",
+            BtrLiveCore.KNOWN_FMP4_HOSTS.contains("d1--ov-gotcha208b.bilivideo.com")
+        )
 
         val signedPlaylist =
             "https://d1--cn-gotcha204.bilivideo.com/live-bvc/123456/live_123_1500/index.m3u8?expires=1700000000&sign=abc%2Fdef%2Bghi%3D%3D&sk=foo%26bar"

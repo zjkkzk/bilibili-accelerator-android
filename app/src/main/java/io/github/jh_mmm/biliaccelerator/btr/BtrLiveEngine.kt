@@ -21,15 +21,22 @@ import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 data class CachedLiveSegment(
     val bytes: ByteArray,
     val contentType: String,
     val host: String,
-    val cachedAt: Long = System.currentTimeMillis()
-)
+    val cachedAt: Long = System.currentTimeMillis(),
+    val targetUrl: String = "",
+    val firstByteMs: Long = 0L,
+    val candidateCount: Int = 1
+) {
+    internal val reported: AtomicBoolean = AtomicBoolean(false)
+}
 
 object BtrLiveEngine {
 
@@ -46,17 +53,29 @@ object BtrLiveEngine {
     private const val MAX_SPECULATIVE_MISSES = 6
     private const val DEFAULT_TEST_SESSION_ID = "__default_test__"
 
+    @Volatile
+    internal var notifyRewriteSink: (RewriteResult) -> Unit = { RemoteClient.notifyRewrite(it) }
+
     private data class PrefetchItem(
         val session: BtrMediaSession,
         val url: String,
-        val isSpeculative: Boolean = false
+        val isSpeculative: Boolean = false,
+        val cacheKey: String = BtrLiveCore.normalizeCacheKey(url)
     )
 
     private class InFlightEntry(
         val future: CompletableFuture<CachedLiveSegment>,
         val isSpeculative: Boolean,
+        val isUrgent: Boolean,
         val accelerateSignal: AtomicBoolean = AtomicBoolean(false),
         val hedgeWakeLock: Object = Object()
+    )
+
+    private class ActiveSegmentAttempt(
+        val host: String,
+        val call: Call,
+        val receivedBytes: AtomicLong,
+        val hostPenalized: AtomicBoolean
     )
 
     private class LiveSessionState(val sessionId: String) {
@@ -75,8 +94,9 @@ object BtrLiveEngine {
         val activeCalls = ConcurrentHashMap.newKeySet<Call>()
         val evicted = AtomicBoolean(false)
 
-        fun isProtectedMapUrl(url: String): Boolean {
-            return synchronized(protectedMapUrls) { protectedMapUrls.containsKey(url) }
+        fun isProtectedMapKey(cacheKey: String): Boolean {
+            if (cacheKey.isBlank()) return false
+            return synchronized(protectedMapUrls) { protectedMapUrls.containsKey(cacheKey) }
         }
     }
 
@@ -167,29 +187,42 @@ object BtrLiveEngine {
     }
 
     internal fun protectMapUrl(url: String, sessionId: String = DEFAULT_TEST_SESSION_ID) {
-        if (url.isNotBlank()) {
+        val key = BtrLiveCore.normalizeCacheKey(url)
+        if (key.isNotBlank()) {
             val state = stateFor(sessionId)
             synchronized(state.protectedMapUrls) {
-                state.protectedMapUrls[url] = true
+                state.protectedMapUrls[key] = true
             }
         }
     }
 
     internal fun putCacheForTest(url: String, segment: CachedLiveSegment, sessionId: String = DEFAULT_TEST_SESSION_ID) {
+        val key = BtrLiveCore.normalizeCacheKey(url)
+        if (key.isBlank()) return
         val state = stateFor(sessionId)
-        state.segmentCache[url] = segment
+        state.segmentCache[key] = segment
         pruneCache(state)
     }
 
-    internal fun getCachedForTest(url: String, sessionId: String = DEFAULT_TEST_SESSION_ID): CachedLiveSegment? =
-        sessionStates[sessionId]?.segmentCache?.get(url)
+    internal fun getCachedForTest(url: String, sessionId: String = DEFAULT_TEST_SESSION_ID): CachedLiveSegment? {
+        val key = BtrLiveCore.normalizeCacheKey(url)
+        return sessionStates[sessionId]?.segmentCache?.get(key)
+    }
+
+    private fun isProtectedMap(state: LiveSessionState, session: BtrMediaSession, cacheKey: String): Boolean {
+        if (cacheKey.isBlank()) return false
+        if (state.isProtectedMapKey(cacheKey)) return true
+        val mapKey = session.liveMapUrl?.let { BtrLiveCore.normalizeCacheKey(it) }
+        return !mapKey.isNullOrBlank() && mapKey == cacheKey
+    }
 
     private fun pruneCache(state: LiveSessionState, protectedUrl: String? = null) {
+        val protectedKey = protectedUrl?.let { BtrLiveCore.normalizeCacheKey(it) }?.takeIf { it.isNotBlank() }
         val now = System.currentTimeMillis()
         val iterator = state.segmentCache.entries.iterator()
         while (iterator.hasNext()) {
             val entry = iterator.next()
-            val isProtected = (protectedUrl != null && entry.key == protectedUrl) || state.isProtectedMapUrl(entry.key)
+            val isProtected = (protectedKey != null && entry.key == protectedKey) || state.isProtectedMapKey(entry.key)
             if (!isProtected && now - entry.value.cachedAt > CACHE_TTL_MS) {
                 iterator.remove()
             }
@@ -197,13 +230,40 @@ object BtrLiveEngine {
         while (state.segmentCache.size > CACHE_LIMIT) {
             val oldest = state.segmentCache.entries
                 .filter { entry ->
-                    val isProtected = (protectedUrl != null && entry.key == protectedUrl) || state.isProtectedMapUrl(entry.key)
+                    val isProtected = (protectedKey != null && entry.key == protectedKey) || state.isProtectedMapKey(entry.key)
                     !isProtected
                 }
                 .minByOrNull { it.value.cachedAt }
                 ?: break
             state.segmentCache.remove(oldest.key)
         }
+    }
+
+    internal fun resolveTargetUrlForHost(
+        session: BtrMediaSession,
+        targetUrl: String,
+        host: String
+    ): String? {
+        val effectiveHostUrls = if (session.liveHostUrls.isNotEmpty() || session.backupUrls.isEmpty()) {
+            session.liveHostUrls
+        } else {
+            val map = LinkedHashMap<String, String>()
+            for (u in (listOf(session.primaryUrl) + session.backupUrls)) {
+                val unwrapped = BtrLiveCore.unwrapProxyUrl(u).ifBlank { u }
+                val h = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(unwrapped)?.host).lowercase()
+                if (h.isNotBlank() && !BtrLiveCore.isP2pUrl(unwrapped)) {
+                    map.putIfAbsent(h, unwrapped)
+                }
+            }
+            map
+        }
+        return BtrLiveCore.resolveTargetUrlForHost(
+            segmentUrl = targetUrl,
+            targetHost = host,
+            liveHostUrls = effectiveHostUrls,
+            primaryUrl = session.primaryUrl,
+            customPoolOnly = session.liveCustomPoolOnly
+        )
     }
 
     /**
@@ -215,12 +275,15 @@ object BtrLiveEngine {
         val pool = session.liveHostPool ?: return
         val unprovenHosts = pool.unproven()
         if (unprovenHosts.isEmpty()) return
-        val toProbe = unprovenHosts.filter { state.probedHosts.add(it) }
-        if (toProbe.isEmpty()) return
+        val probeTargets = unprovenHosts.mapNotNull { host ->
+            val probeUrl = resolveTargetUrlForHost(session, sampleUrl, host) ?: return@mapNotNull null
+            if (state.probedHosts.add(host)) host to probeUrl else null
+        }
+        if (probeTargets.isEmpty()) return
 
         val ua = session.userAgent ?: "BiliApp/7800300"
         val ref = session.referer
-        for (host in toProbe) {
+        for ((host, probeUrl) in probeTargets) {
             try {
                 probingPool.execute {
                     if (state.evicted.get()) {
@@ -229,7 +292,6 @@ object BtrLiveEngine {
                     }
                     var call: Call? = null
                     try {
-                        val probeUrl = BtrLiveCore.swapHost(sampleUrl, host)
                         val req = Request.Builder()
                             .url(probeUrl)
                             .header("Range", "bytes=0-2047")
@@ -279,17 +341,20 @@ object BtrLiveEngine {
         allow404: Boolean = false,
         isSpeculative: Boolean = false,
         requestUserAgent: String? = null,
-        requestReferer: String? = null
+        requestReferer: String? = null,
+        firstByteTimeoutMs: Long = FIRST_BYTE_TIMEOUT_MS,
+        segmentTimeoutMs: Long = SEGMENT_TIMEOUT_MS
     ): CachedLiveSegment {
         val state = stateFor(session.sessionId)
         if (state.evicted.get()) {
             throw CancellationException("Live session evicted")
         }
         val normalizedUrl = BtrLiveCore.unwrapProxyUrl(url).ifBlank { url }
-        val isMap = state.isProtectedMapUrl(normalizedUrl) || session.liveMapUrl == normalizedUrl
+        val cacheKey = BtrLiveCore.normalizeCacheKey(normalizedUrl)
+        val isMap = isProtectedMap(state, session, cacheKey)
 
-        // 1. 优先命中内存缓存（#EXT-X-MAP 初始化分片受免过期保护）
-        state.segmentCache[normalizedUrl]?.let {
+        // 1. 优先命中内存缓存（按规范化路径键跨节点/跨签名复用，#EXT-X-MAP 初始化分片受免过期保护）
+        state.segmentCache[cacheKey]?.let {
             if (isMap || System.currentTimeMillis() - it.cachedAt < CACHE_TTL_MS) {
                 return it
             }
@@ -297,29 +362,34 @@ object BtrLiveEngine {
 
         // 2. 避免预取与即时请求重复下载：共享 in-flight CompletableFuture
         var isOwner = false
-        val entry = state.inFlightSegments.computeIfAbsent(normalizedUrl) {
+        val entry = state.inFlightSegments.computeIfAbsent(cacheKey) {
             isOwner = true
-            InFlightEntry(CompletableFuture(), isSpeculative)
+            InFlightEntry(CompletableFuture(), isSpeculative = isSpeculative, isUrgent = urgent)
         }
         val future = entry.future
         if (!isOwner) {
-            if (urgent && entry.isSpeculative) {
+            // 无论在途任务是预测性预取还是普通后台预取，只要播放器即时命中即刻唤醒并将对冲延迟缩短至 URGENT_HEDGE_MS
+            if (urgent && !entry.isUrgent) {
                 entry.accelerateSignal.set(true)
                 synchronized(entry.hedgeWakeLock) { entry.hedgeWakeLock.notifyAll() }
             }
             return try {
-                future.get(SEGMENT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                future.get(segmentTimeoutMs, TimeUnit.MILLISECONDS)
             } catch (e: Exception) {
                 if (state.evicted.get()) throw e
-                state.segmentCache[normalizedUrl]?.let { return it }
+                state.segmentCache[cacheKey]?.let { return it }
                 if (allow404) throw e
                 downloadFallbackSegment(session, normalizedUrl, requestUserAgent, requestReferer, state)
             }
         }
 
         val pool = session.liveHostPool ?: BtrLiveHostPool().also { session.liveHostPool = it }
-        val hosts = pool.pick(2).ifEmpty {
-            val originHost = BiliAcceleratorCore.parseUri(normalizedUrl)?.host.orEmpty()
+        val originHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(normalizedUrl)?.host)
+        val compatibleRanked = pool.pick(8)
+            .filter { resolveTargetUrlForHost(session, normalizedUrl, it) != null }
+            .distinct()
+            .take(2)
+        val hosts = compatibleRanked.ifEmpty {
             if (originHost.isNotBlank()) listOf(originHost) else listOf("d1--cn-gotcha204.bilivideo.com")
         }
 
@@ -330,16 +400,27 @@ object BtrLiveEngine {
         }
         val effectiveUa = requestUserAgent ?: session.userAgent ?: "BiliApp/7800300"
         val effectiveRef = requestReferer ?: session.referer
-        val activeCalls = mutableListOf<Call>()
+        val activeAttempts = mutableListOf<ActiveSegmentAttempt>()
         val isCompleted = AtomicBoolean(false)
+        val totalTimedOut = AtomicBoolean(false)
         val primaryFailedSignal = AtomicBoolean(false)
         val hedgeWakeLock = entry.hedgeWakeLock
         val failureCount = AtomicInteger(0)
         val hit404Count = AtomicInteger(0)
 
         fun attemptOnHost(host: String, isPrimary: Boolean) {
-            if (state.evicted.get() || isCompleted.get()) return
-            val targetUrl = BtrLiveCore.swapHost(normalizedUrl, host)
+            if (state.evicted.get() || isCompleted.get() || totalTimedOut.get()) return
+            val targetUrl = resolveTargetUrlForHost(session, normalizedUrl, host)
+            if (targetUrl == null) {
+                if (isPrimary) {
+                    primaryFailedSignal.set(true)
+                    synchronized(hedgeWakeLock) { hedgeWakeLock.notifyAll() }
+                }
+                if (failureCount.incrementAndGet() >= hosts.size) {
+                    future.completeExceptionally(IllegalStateException("Incompatible live host without signed URL: $host"))
+                }
+                return
+            }
             val req = Request.Builder()
                 .url(targetUrl)
                 .header("User-Agent", effectiveUa)
@@ -347,26 +428,29 @@ object BtrLiveEngine {
                 .build()
 
             val call = BtrHttpClient.client.newCall(req)
-            synchronized(activeCalls) {
-                if (isCompleted.get() || state.evicted.get()) return
-                activeCalls.add(call)
+            val receivedBytes = AtomicLong(0L)
+            val hostPenalized = AtomicBoolean(false)
+            val attemptRecord = ActiveSegmentAttempt(host, call, receivedBytes, hostPenalized)
+            synchronized(activeAttempts) {
+                if (isCompleted.get() || state.evicted.get() || totalTimedOut.get()) return
+                activeAttempts.add(attemptRecord)
             }
             state.activeCalls.add(call)
 
             val startTime = System.currentTimeMillis()
             val hasFirstByte = AtomicBoolean(false)
+            val fbTimedOut = AtomicBoolean(false)
             val fbWatchdog: ScheduledFuture<*> = firstByteWatchdog.schedule(
                 {
-                    if (!hasFirstByte.get() && !isCompleted.get()) {
+                    if (!hasFirstByte.get() && !isCompleted.get() && !state.evicted.get()) {
+                        fbTimedOut.set(true)
                         runCatching { call.cancel() }
                     }
                 },
-                FIRST_BYTE_TIMEOUT_MS,
+                firstByteTimeoutMs,
                 TimeUnit.MILLISECONDS
             )
 
-            var received = 0L
-            val hostPenalized = AtomicBoolean(false)
             try {
                 call.execute().use { resp ->
                     if (resp.code != 200 && resp.code != 206) {
@@ -407,9 +491,13 @@ object BtrLiveEngine {
                             firstByteMs = maxOf(1.0, (System.currentTimeMillis() - startTime).toDouble())
                             fbWatchdog.cancel(false)
                         }
-                        if (isCompleted.get() || state.evicted.get()) return
+                        if (isCompleted.get() || state.evicted.get() || totalTimedOut.get()) return
                         out.write(buffer, 0, read)
-                        received += read
+                        receivedBytes.addAndGet(read.toLong())
+                    }
+
+                    if (fbTimedOut.get() || totalTimedOut.get()) {
+                        throw TimeoutException("Live segment timed out on $host")
                     }
 
                     val data = out.toByteArray()
@@ -428,48 +516,35 @@ object BtrLiveEngine {
                     val segment = CachedLiveSegment(
                         bytes = data,
                         contentType = resp.header("Content-Type") ?: "video/iso.segment",
-                        host = host
+                        host = host,
+                        targetUrl = targetUrl,
+                        firstByteMs = effectiveFbMs.toLong(),
+                        candidateCount = hosts.size
                     )
 
                     if (!state.evicted.get() && isCompleted.compareAndSet(false, true)) {
-                        state.segmentCache[normalizedUrl] = segment
+                        state.segmentCache[cacheKey] = segment
                         pruneCache(state, session.liveMapUrl)
                         synchronized(hedgeWakeLock) { hedgeWakeLock.notifyAll() }
-                        synchronized(activeCalls) {
-                            activeCalls.forEach { if (it != call && !it.isCanceled()) it.cancel() }
+                        synchronized(activeAttempts) {
+                            activeAttempts.forEach { if (it.call != call && !it.call.isCanceled()) it.call.cancel() }
                         }
                         future.complete(segment)
-
-                        RemoteClient.notifyRewrite(
-                            RewriteResult(
-                                changed = true,
-                                originalUrl = normalizedUrl,
-                                finalUrl = targetUrl,
-                                originalHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(normalizedUrl)?.host),
-                                targetHost = host,
-                                reason = "BTR直播分片对冲加速 · 首包${effectiveFbMs.toLong()}ms",
-                                isPcdn = false,
-                                isMcdn = false,
-                                segmentKey = normalizedUrl.substringAfterLast('/'),
-                                isBtr = true,
-                                btrChunks = 1,
-                                btrBytes = data.size.toLong(),
-                                btrConcurrency = hosts.size,
-                                btrCdnCount = hosts.size,
-                                btrAvgLatencyMs = effectiveFbMs.toLong()
-                            )
-                        )
                     }
                 }
             } catch (t: Throwable) {
-                if (!isCompleted.get() &&
-                    !state.evicted.get() &&
+                // 对齐上游 live-hook.js：首字节看门狗超时与总超时属于节点故障（TimeoutError），必须上报 pool.failure，
+                // 仅在另一竞速副本胜出、会话淘汰或非超时主动取消（AbortError）时豁免惩罚。
+                val isTimeoutCancel = fbTimedOut.get() || totalTimedOut.get()
+                val isNonTimeoutAbort = isCompleted.get() ||
+                    state.evicted.get() ||
+                    (call.isCanceled() && !isTimeoutCancel)
+                if (!isNonTimeoutAbort &&
                     t !is SpeculativeNotReadyException &&
                     t !is NonPenaltyHttpException &&
-                    !call.isCanceled() &&
                     hostPenalized.compareAndSet(false, true)
                 ) {
-                    pool.failure(host, received)
+                    pool.failure(host, receivedBytes.get())
                 }
                 if (isPrimary) {
                     primaryFailedSignal.set(true)
@@ -489,27 +564,29 @@ object BtrLiveEngine {
             attemptOnHost(hosts[0], isPrimary = true)
         }
 
-        // 若有备选节点，监听对冲超时、主路提前失败或即时请求升级唤醒
+        // 若有备选节点，监听对冲超时、主路提前失败或即时请求升级唤醒（对预测性与普通预取均生效）
         if (hosts.size > 1) {
             executeLiveWorker {
                 try {
-                    val deadline = System.currentTimeMillis() + hedgeDelay
+                    val hedgeStartMs = System.currentTimeMillis()
+                    val deadline = hedgeStartMs + hedgeDelay
                     synchronized(hedgeWakeLock) {
                         while (!isCompleted.get() &&
                             !primaryFailedSignal.get() &&
                             !state.evicted.get() &&
-                            !(isSpeculative && entry.accelerateSignal.get())
+                            !totalTimedOut.get()
                         ) {
-                            val rem = if (entry.accelerateSignal.get()) {
-                                minOf(URGENT_HEDGE_MS, maxOf(0L, deadline - System.currentTimeMillis()))
+                            val effectiveDeadline = if (entry.accelerateSignal.get()) {
+                                minOf(deadline, hedgeStartMs + URGENT_HEDGE_MS)
                             } else {
-                                deadline - System.currentTimeMillis()
+                                deadline
                             }
+                            val rem = effectiveDeadline - System.currentTimeMillis()
                             if (rem <= 0L) break
                             hedgeWakeLock.wait(rem)
                         }
                     }
-                    if (!isCompleted.get() && !state.evicted.get()) {
+                    if (!isCompleted.get() && !state.evicted.get() && !totalTimedOut.get()) {
                         attemptOnHost(hosts[1], isPrimary = false)
                     }
                 } catch (_: InterruptedException) {}
@@ -517,10 +594,26 @@ object BtrLiveEngine {
         }
 
         return try {
-            future.get(SEGMENT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            future.get(segmentTimeoutMs, TimeUnit.MILLISECONDS)
         } catch (e: Exception) {
-            synchronized(activeCalls) {
-                activeCalls.forEach { if (!it.isCanceled()) runCatching { it.cancel() } }
+            val isTimeout = e is TimeoutException
+            if (isTimeout) {
+                totalTimedOut.set(true)
+            }
+            synchronized(hedgeWakeLock) { hedgeWakeLock.notifyAll() }
+            synchronized(activeAttempts) {
+                for (attempt in activeAttempts) {
+                    if (isTimeout &&
+                        !isCompleted.get() &&
+                        !state.evicted.get() &&
+                        attempt.hostPenalized.compareAndSet(false, true)
+                    ) {
+                        pool.failure(attempt.host, attempt.receivedBytes.get())
+                    }
+                    if (!attempt.call.isCanceled()) {
+                        runCatching { attempt.call.cancel() }
+                    }
+                }
             }
             if (state.evicted.get()) {
                 val err = CancellationException("Live session evicted")
@@ -541,7 +634,7 @@ object BtrLiveEngine {
                 throw fbErr
             }
         } finally {
-            state.inFlightSegments.remove(normalizedUrl, entry)
+            state.inFlightSegments.remove(cacheKey, entry)
         }
     }
 
@@ -590,7 +683,7 @@ object BtrLiveEngine {
                     host = "fallback"
                 )
                 if (!state.evicted.get()) {
-                    state.segmentCache[normalizedUrl] = segment
+                    state.segmentCache[BtrLiveCore.normalizeCacheKey(normalizedUrl)] = segment
                     pruneCache(state, session.liveMapUrl)
                 }
                 segment
@@ -631,14 +724,15 @@ object BtrLiveEngine {
             pool.pick(3).ifEmpty { listOfNotNull(origHost.takeIf { it.isNotBlank() }) }.distinct()
         }
         val candidateUrls = if (candidateHosts.isNotEmpty()) {
-            candidateHosts.map { host ->
+            candidateHosts.mapNotNull { host ->
                 val targetUrl = if (requestedSubUrl == null) {
-                    session.liveHostUrls[host.lowercase()] ?: BtrLiveCore.swapHost(originalUrl, host)
+                    session.liveHostUrls[host.lowercase()]
+                        ?: resolveTargetUrlForHost(session, originalUrl, host)
                 } else {
-                    BtrLiveCore.swapHost(originalUrl, host)
+                    resolveTargetUrlForHost(session, originalUrl, host)
                 }
-                targetUrl to host
-            }
+                targetUrl?.let { it to host }
+            }.ifEmpty { listOf(originalUrl to origHost) }
         } else {
             listOf(originalUrl to origHost)
         }
@@ -716,9 +810,10 @@ object BtrLiveEngine {
                             session.liveMapUrl = normalizedMap
                             protectMapUrl(normalizedMap, session.sessionId)
                         }
+                        // 对齐上游 live-hook.js：仅在预测性预取实际命中成功时才清零 liveSpeculativeMisses，
+                        // 绝不在播放列表推进 lastNum 时重置，避免非 +1（时间戳命名）直播流无限刷 404
                         if (parsed.lastNum > session.liveLastNum.get()) {
                             session.liveLastNum.set(parsed.lastNum)
-                            session.liveSpeculativeMisses.set(0)
                         }
 
                         // 探测候选节点
@@ -869,13 +964,14 @@ object BtrLiveEngine {
     private fun enqueuePrefetch(state: LiveSessionState, session: BtrMediaSession, url: String, isSpeculative: Boolean) {
         if (state.evicted.get()) return
         val cleanUrl = BtrLiveCore.unwrapProxyUrl(url).ifBlank { url }
-        if (cleanUrl.isBlank() || state.segmentCache.containsKey(cleanUrl) || state.inFlightSegments.containsKey(cleanUrl)) return
-        if (state.queuedPrefetchUrls.add(cleanUrl)) {
+        val cacheKey = BtrLiveCore.normalizeCacheKey(cleanUrl)
+        if (cleanUrl.isBlank() || cacheKey.isBlank() || state.segmentCache.containsKey(cacheKey) || state.inFlightSegments.containsKey(cacheKey)) return
+        if (state.queuedPrefetchUrls.add(cacheKey)) {
             while (state.prefetchQueue.size >= MAX_PREFETCH_QUEUE_DEPTH) {
                 val dropped = state.prefetchQueue.pollFirst() ?: break
-                state.queuedPrefetchUrls.remove(dropped.url)
+                state.queuedPrefetchUrls.remove(dropped.cacheKey)
             }
-            state.prefetchQueue.offerLast(PrefetchItem(session, cleanUrl, isSpeculative))
+            state.prefetchQueue.offerLast(PrefetchItem(session, cleanUrl, isSpeculative, cacheKey))
         }
     }
 
@@ -884,12 +980,12 @@ object BtrLiveEngine {
         val maxConcurrent = if (state.urgentInflight.get() > 0) 1 else 3
         while (!state.evicted.get() && state.inflightPrefetches.get() < maxConcurrent) {
             val item = state.prefetchQueue.pollFirst() ?: break
-            state.queuedPrefetchUrls.remove(item.url)
-            if (state.segmentCache.containsKey(item.url)) continue
+            state.queuedPrefetchUrls.remove(item.cacheKey)
+            if (state.segmentCache.containsKey(item.cacheKey)) continue
 
             if (state.inflightPrefetches.incrementAndGet() > maxConcurrent) {
                 state.inflightPrefetches.decrementAndGet()
-                if (state.queuedPrefetchUrls.add(item.url)) {
+                if (state.queuedPrefetchUrls.add(item.cacheKey)) {
                     state.prefetchQueue.offerFirst(item)
                 }
                 break
@@ -911,7 +1007,7 @@ object BtrLiveEngine {
                             }
                         }
                     } catch (e: Throwable) {
-                        if (item.isSpeculative && e is SpeculativeNotReadyException) {
+                        if (item.isSpeculative && !state.evicted.get()) {
                             item.session.liveSpeculativeMisses.incrementAndGet()
                         }
                     } finally {
@@ -933,10 +1029,12 @@ object BtrLiveEngine {
 
         // 1. 最高优先级立即异步预取 #EXT-X-MAP 初始化分片，避免排在普通分片预取队列尾部造成首帧等待
         val cleanMapUrl = mapUrl?.let { BtrLiveCore.unwrapProxyUrl(it).ifBlank { it } }
+        val mapCacheKey = cleanMapUrl?.let { BtrLiveCore.normalizeCacheKey(it) }.orEmpty()
         if (!cleanMapUrl.isNullOrBlank() &&
-            !state.segmentCache.containsKey(cleanMapUrl) &&
-            !state.inFlightSegments.containsKey(cleanMapUrl) &&
-            state.queuedPrefetchUrls.add(cleanMapUrl)
+            mapCacheKey.isNotBlank() &&
+            !state.segmentCache.containsKey(mapCacheKey) &&
+            !state.inFlightSegments.containsKey(mapCacheKey) &&
+            state.queuedPrefetchUrls.add(mapCacheKey)
         ) {
             try {
                 livePrefetchPool.execute {
@@ -952,11 +1050,11 @@ object BtrLiveEngine {
                         }
                     } catch (_: Throwable) {
                     } finally {
-                        state.queuedPrefetchUrls.remove(cleanMapUrl)
+                        state.queuedPrefetchUrls.remove(mapCacheKey)
                     }
                 }
             } catch (_: RejectedExecutionException) {
-                state.queuedPrefetchUrls.remove(cleanMapUrl)
+                state.queuedPrefetchUrls.remove(mapCacheKey)
             }
         }
 
@@ -964,7 +1062,8 @@ object BtrLiveEngine {
         var enqueuedReal = 0
         for (seg in segments) {
             val cleanSegUrl = BtrLiveCore.unwrapProxyUrl(seg.url).ifBlank { seg.url }
-            if (!state.segmentCache.containsKey(cleanSegUrl)) {
+            val segKey = BtrLiveCore.normalizeCacheKey(cleanSegUrl)
+            if (segKey.isNotBlank() && !state.segmentCache.containsKey(segKey)) {
                 enqueuePrefetch(state, session, cleanSegUrl, isSpeculative = false)
                 enqueuedReal++
             }
@@ -979,6 +1078,197 @@ object BtrLiveEngine {
         }
 
         drainPrefetchQueue(state)
+    }
+
+    private fun notifySegmentConsumed(originalUrl: String, segment: CachedLiveSegment) {
+        if (segment.host == "fallback") return
+        if (!segment.reported.compareAndSet(false, true)) return
+        val finalUrl = segment.targetUrl.ifBlank { originalUrl }
+        val fbMs = segment.firstByteMs
+        notifyRewriteSink(
+            RewriteResult(
+                changed = true,
+                originalUrl = originalUrl,
+                finalUrl = finalUrl,
+                originalHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(originalUrl)?.host),
+                targetHost = segment.host,
+                reason = "BTR直播分片对冲加速 · 首包${fbMs}ms",
+                isPcdn = false,
+                isMcdn = false,
+                segmentKey = originalUrl.substringAfterLast('/'),
+                isBtr = true,
+                btrChunks = 1,
+                btrBytes = segment.bytes.size.toLong(),
+                btrConcurrency = segment.candidateCount,
+                btrCdnCount = segment.candidateCount,
+                btrAvgLatencyMs = fbMs
+            )
+        )
+    }
+
+    private fun httpStatusReason(code: Int): String = when (code) {
+        200 -> "OK"
+        206 -> "Partial Content"
+        404 -> "Not Found"
+        416 -> "Range Not Satisfiable"
+        else -> "Error"
+    }
+
+    private fun serveCachedRangeSegment(
+        targetUrl: String,
+        segment: CachedLiveSegment,
+        parsedRange: ParsedRange,
+        clientOut: OutputStream,
+        keepAlive: Boolean,
+        isHeadOnly: Boolean
+    ): Boolean {
+        val total = segment.bytes.size.toLong()
+        val connHeader = if (keepAlive) "Connection: keep-alive\r\nKeep-Alive: timeout=15, max=100\r\n\r\n" else "Connection: close\r\n\r\n"
+        if (parsedRange.isInvalid || total <= 0L) {
+            val resp = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */$total\r\nContent-Length: 0\r\n$connHeader"
+            clientOut.write(resp.toByteArray(Charsets.US_ASCII))
+            clientOut.flush()
+            return keepAlive
+        }
+        val sliceStart: Long
+        val sliceEnd: Long
+        if (parsedRange.isSuffix) {
+            if (parsedRange.suffixLength <= 0L) {
+                val resp = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */$total\r\nContent-Length: 0\r\n$connHeader"
+                clientOut.write(resp.toByteArray(Charsets.US_ASCII))
+                clientOut.flush()
+                return keepAlive
+            }
+            sliceStart = maxOf(0L, total - parsedRange.suffixLength)
+            sliceEnd = total - 1L
+        } else {
+            if (parsedRange.start >= total) {
+                val resp = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */$total\r\nContent-Length: 0\r\n$connHeader"
+                clientOut.write(resp.toByteArray(Charsets.US_ASCII))
+                clientOut.flush()
+                return keepAlive
+            }
+            sliceStart = parsedRange.start
+            sliceEnd = minOf(parsedRange.end ?: (total - 1L), total - 1L)
+            if (sliceEnd < sliceStart) {
+                val resp = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */$total\r\nContent-Length: 0\r\n$connHeader"
+                clientOut.write(resp.toByteArray(Charsets.US_ASCII))
+                clientOut.flush()
+                return keepAlive
+            }
+        }
+        val sliceLen = (sliceEnd - sliceStart + 1L).toInt()
+        val headerBuilder = StringBuilder()
+        headerBuilder.append("HTTP/1.1 206 Partial Content\r\n")
+        headerBuilder.append("Content-Type: ${segment.contentType}\r\n")
+        headerBuilder.append("Accept-Ranges: bytes\r\n")
+        headerBuilder.append("Content-Range: bytes $sliceStart-$sliceEnd/$total\r\n")
+        headerBuilder.append("Content-Length: $sliceLen\r\n")
+        headerBuilder.append(connHeader)
+
+        clientOut.write(headerBuilder.toString().toByteArray(Charsets.US_ASCII))
+        if (!isHeadOnly) {
+            clientOut.write(segment.bytes, sliceStart.toInt(), sliceLen)
+            notifySegmentConsumed(targetUrl, segment)
+        }
+        clientOut.flush()
+        return keepAlive
+    }
+
+    private fun pipeRangeSegmentPassthrough(
+        session: BtrMediaSession,
+        state: LiveSessionState,
+        targetUrl: String,
+        rangeHeader: String,
+        clientOut: OutputStream,
+        keepAlive: Boolean,
+        isHeadOnly: Boolean,
+        requestUserAgent: String?,
+        requestReferer: String?
+    ): Boolean {
+        val pool = session.liveHostPool
+        val candidateUrls = buildList {
+            if (pool != null) {
+                for (host in pool.pick(3)) {
+                    val resolved = resolveTargetUrlForHost(session, targetUrl, host)
+                    if (!resolved.isNullOrBlank()) add(resolved)
+                }
+            }
+            add(targetUrl)
+        }.distinct()
+
+        val effectiveUa = requestUserAgent ?: session.userAgent ?: "BiliApp/7800300"
+        val effectiveRef = requestReferer ?: session.referer
+        var lastErrorCode = 502
+
+        for (candUrl in candidateUrls) {
+            if (state.evicted.get()) return false
+            val req = Request.Builder()
+                .url(candUrl)
+                .header("Range", rangeHeader)
+                .header("User-Agent", effectiveUa)
+                .header("Referer", effectiveRef)
+                .build()
+            val call = BtrHttpClient.client.newCall(req)
+            state.activeCalls.add(call)
+            var headersSent = false
+            try {
+                call.execute().use { resp ->
+                    val code = resp.code
+                    if (code != 206 && code != 200 && code != 416) {
+                        lastErrorCode = code
+                        return@use
+                    }
+                    val contentRange = resp.header("Content-Range")
+                    val contentType = resp.header("Content-Type") ?: "video/iso.segment"
+                    val body = resp.body
+                    val contentLength = if (code == 416) 0L else (body?.contentLength() ?: -1L)
+                    val canKeepAlive = keepAlive && contentLength >= 0L
+                    val connHeader = if (canKeepAlive) {
+                        "Connection: keep-alive\r\nKeep-Alive: timeout=15, max=100\r\n\r\n"
+                    } else {
+                        "Connection: close\r\n\r\n"
+                    }
+
+                    val headerBuilder = StringBuilder()
+                    headerBuilder.append("HTTP/1.1 $code ${httpStatusReason(code)}\r\n")
+                    if (code != 416) {
+                        headerBuilder.append("Content-Type: $contentType\r\n")
+                        headerBuilder.append("Accept-Ranges: bytes\r\n")
+                    }
+                    if (!contentRange.isNullOrBlank()) {
+                        headerBuilder.append("Content-Range: $contentRange\r\n")
+                    }
+                    if (contentLength >= 0L) {
+                        headerBuilder.append("Content-Length: $contentLength\r\n")
+                    }
+                    headerBuilder.append(connHeader)
+
+                    headersSent = true
+                    clientOut.write(headerBuilder.toString().toByteArray(Charsets.US_ASCII))
+                    if (!isHeadOnly && code != 416 && body != null) {
+                        val inStream = body.byteStream()
+                        val buf = ByteArray(16 * 1024)
+                        var read: Int
+                        while (inStream.read(buf).also { read = it } != -1) {
+                            clientOut.write(buf, 0, read)
+                        }
+                    }
+                    clientOut.flush()
+                    return canKeepAlive
+                }
+            } catch (t: Throwable) {
+                if (headersSent) {
+                    Log.i(TAG, "Live ranged segment client write interrupted: ${t.message}")
+                    return false
+                }
+                lastErrorCode = 502
+            } finally {
+                state.activeCalls.remove(call)
+            }
+        }
+        sendError(clientOut, lastErrorCode, "Bad Gateway - Live Segment Range Unreachable")
+        return false
     }
 
     /**
@@ -1001,10 +1291,48 @@ object BtrLiveEngine {
             "$base/$fileName"
         }
         val targetUrl = BtrLiveCore.unwrapProxyUrl(rawTargetUrl).ifBlank { rawTargetUrl }
+        val cacheKey = BtrLiveCore.normalizeCacheKey(targetUrl)
+        val rangeHeader = headers.entries
+            .firstOrNull { it.key.equals("range", ignoreCase = true) }
+            ?.value
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
 
         state.urgentInflight.incrementAndGet()
         var headersSent = false
         return try {
+            if (rangeHeader != null) {
+                // 对齐上游 live-hook.js：客户端携带 Range 时绝不忽略 Range 返回 200 OK 全量字节
+                val cached = state.segmentCache[cacheKey]?.takeIf {
+                    isProtectedMap(state, session, cacheKey) || System.currentTimeMillis() - it.cachedAt < CACHE_TTL_MS
+                }
+                if (cached != null && !rangeHeader.contains(',')) {
+                    val parsedRange = BtrLocalProxyServer.parseRangeHeader(rangeHeader)
+                    if (parsedRange.hasRange) {
+                        headersSent = true
+                        return serveCachedRangeSegment(
+                            targetUrl = targetUrl,
+                            segment = cached,
+                            parsedRange = parsedRange,
+                            clientOut = clientOut,
+                            keepAlive = keepAlive,
+                            isHeadOnly = isHeadOnly
+                        )
+                    }
+                }
+                return pipeRangeSegmentPassthrough(
+                    session = session,
+                    state = state,
+                    targetUrl = targetUrl,
+                    rangeHeader = rangeHeader,
+                    clientOut = clientOut,
+                    keepAlive = keepAlive,
+                    isHeadOnly = isHeadOnly,
+                    requestUserAgent = requestUserAgent,
+                    requestReferer = requestReferer
+                )
+            }
+
             val segment = downloadLiveSegment(
                 session = session,
                 url = targetUrl,
@@ -1017,6 +1345,7 @@ object BtrLiveEngine {
             val headerBuilder = StringBuilder()
             headerBuilder.append("HTTP/1.1 200 OK\r\n")
             headerBuilder.append("Content-Type: ${segment.contentType}\r\n")
+            headerBuilder.append("Accept-Ranges: bytes\r\n")
             headerBuilder.append("Content-Length: ${segment.bytes.size}\r\n")
             if (keepAlive) {
                 headerBuilder.append("Connection: keep-alive\r\nKeep-Alive: timeout=15, max=100\r\n\r\n")
@@ -1028,6 +1357,7 @@ object BtrLiveEngine {
             clientOut.write(headerBuilder.toString().toByteArray(Charsets.US_ASCII))
             if (!isHeadOnly) {
                 clientOut.write(segment.bytes)
+                notifySegmentConsumed(targetUrl, segment)
             }
             clientOut.flush()
             keepAlive
@@ -1054,6 +1384,12 @@ object BtrLiveEngine {
         val connectLatencyMs: Double
     )
 
+    private class ActiveFlvAttempt(
+        val host: String,
+        val call: Call,
+        val hostPenalized: AtomicBoolean
+    )
+
     /**
      * 处理持续长连接直播流（如 .flv）：多源对冲竞速响应最快上游并无缝透传
      */
@@ -1069,26 +1405,33 @@ object BtrLiveEngine {
         val state = stateFor(session.sessionId)
         val originalUrl = BtrLiveCore.unwrapProxyUrl(session.primaryUrl).ifBlank { session.primaryUrl }
         val pool = session.liveHostPool ?: BtrLiveHostPool().also { session.liveHostPool = it }
-        val hosts = pool.pick(2).ifEmpty {
-            val originHost = BiliAcceleratorCore.parseUri(originalUrl)?.host.orEmpty()
-            if (originHost.isNotBlank()) listOf(originHost) else listOf("d1--cn-gotcha204.bilivideo.com")
+        val originHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(originalUrl)?.host)
+        // 使用 resolveTargetUrlForHost 校验跨厂商 FLV 鉴权签名兼容性，严禁盲目 swapHost 触发 HTTP 403 误封
+        val compatibleCandidates = pool.pick(8)
+            .mapNotNull { host ->
+                val resolved = resolveTargetUrlForHost(session, originalUrl, host) ?: return@mapNotNull null
+                host to resolved
+            }
+            .distinctBy { it.first.lowercase() }
+            .take(2)
+        val raceCandidates = compatibleCandidates.ifEmpty {
+            val fallbackHost = originHost.ifBlank { "d1--cn-gotcha204.bilivideo.com" }
+            listOf(fallbackHost to originalUrl)
         }
 
         val effectiveUa = requestUserAgent ?: session.userAgent ?: "BiliApp/7800300"
         val effectiveRef = requestReferer ?: session.referer
-        val raceCandidates = hosts.take(2)
         val winnerFuture = CompletableFuture<FlvRaceWinner?>()
         val winnerClaimed = AtomicBoolean(false)
         val timedOut = AtomicBoolean(false)
+        val raceFinished = AtomicBoolean(false)
         val primaryFailed = AtomicBoolean(false)
         val wakeLock = Object()
-        val activeCalls = ConcurrentHashMap.newKeySet<Call>()
+        val activeAttempts = ConcurrentHashMap.newKeySet<ActiveFlvAttempt>()
         val failedCount = AtomicInteger(0)
 
-        fun connectCandidate(host: String, isPrimary: Boolean) {
-            if (state.evicted.get() || timedOut.get() || winnerClaimed.get()) return
-            // 优先使用该节点完整原始备份 URL（保留每条 FLV 线路独立的签名/extra 参数），无精确映射时再 swapHost
-            val targetUrl = session.liveHostUrls[host.lowercase()] ?: BtrLiveCore.swapHost(originalUrl, host)
+        fun connectCandidate(host: String, targetUrl: String, isPrimary: Boolean) {
+            if (state.evicted.get() || raceFinished.get() || winnerClaimed.get()) return
             val req = Request.Builder()
                 .url(targetUrl)
                 .header("User-Agent", effectiveUa)
@@ -1096,10 +1439,11 @@ object BtrLiveEngine {
                 .build()
 
             val call = BtrHttpClient.liveStreamClient.newCall(req)
-            activeCalls.add(call)
+            val hostPenalized = AtomicBoolean(false)
+            val attemptRecord = ActiveFlvAttempt(host, call, hostPenalized)
+            activeAttempts.add(attemptRecord)
             state.activeCalls.add(call)
             val startTime = System.currentTimeMillis()
-            val hostPenalized = AtomicBoolean(false)
 
             try {
                 val resp = call.execute()
@@ -1112,24 +1456,26 @@ object BtrLiveEngine {
                     throw Exception("FLV HTTP $code")
                 }
                 val connectLatency = maxOf(1.0, (System.currentTimeMillis() - startTime).toDouble())
-                if (!timedOut.get() && !state.evicted.get() && winnerClaimed.compareAndSet(false, true)) {
+                if (!raceFinished.get() && !state.evicted.get() && winnerClaimed.compareAndSet(false, true)) {
                     val candidateWinner = FlvRaceWinner(host, targetUrl, resp, call, connectLatency)
-                    if (timedOut.get() || state.evicted.get() || !winnerFuture.complete(candidateWinner)) {
+                    if (raceFinished.get() || state.evicted.get() || !winnerFuture.complete(candidateWinner)) {
                         runCatching { resp.close() }
                     } else {
                         synchronized(wakeLock) { wakeLock.notifyAll() }
-                        activeCalls.forEach { other ->
-                            if (other != call && !other.isCanceled()) runCatching { other.cancel() }
+                        activeAttempts.forEach { other ->
+                            if (other.call != call && !other.call.isCanceled()) runCatching { other.call.cancel() }
                         }
                     }
                 } else {
                     runCatching { resp.close() }
                 }
             } catch (t: Throwable) {
+                val isTimeoutCancel = timedOut.get()
+                val isNonTimeoutAbort = state.evicted.get() ||
+                    (winnerClaimed.get() && !isTimeoutCancel) ||
+                    (call.isCanceled() && !isTimeoutCancel)
                 if (t !is NonPenaltyHttpException &&
-                    !call.isCanceled() &&
-                    !timedOut.get() &&
-                    !state.evicted.get() &&
+                    !isNonTimeoutAbort &&
                     hostPenalized.compareAndSet(false, true)
                 ) {
                     pool.failure(host, 0L)
@@ -1142,17 +1488,17 @@ object BtrLiveEngine {
                     winnerFuture.complete(null)
                 }
             } finally {
-                activeCalls.remove(call)
+                activeAttempts.remove(attemptRecord)
                 state.activeCalls.remove(call)
             }
         }
 
-        executeLiveWorker { connectCandidate(raceCandidates[0], isPrimary = true) }
+        executeLiveWorker { connectCandidate(raceCandidates[0].first, raceCandidates[0].second, isPrimary = true) }
         if (raceCandidates.size > 1) {
             executeLiveWorker {
                 val deadline = System.currentTimeMillis() + HEDGE_MS
                 synchronized(wakeLock) {
-                    while (!winnerClaimed.get() && !primaryFailed.get() && !timedOut.get() && !state.evicted.get()) {
+                    while (!winnerClaimed.get() && !primaryFailed.get() && !raceFinished.get() && !state.evicted.get()) {
                         val rem = deadline - System.currentTimeMillis()
                         if (rem <= 0L) break
                         try {
@@ -1162,26 +1508,37 @@ object BtrLiveEngine {
                         }
                     }
                 }
-                if (!winnerClaimed.get() && !timedOut.get() && !state.evicted.get()) {
-                    connectCandidate(raceCandidates[1], isPrimary = false)
+                if (!winnerClaimed.get() && !raceFinished.get() && !state.evicted.get()) {
+                    connectCandidate(raceCandidates[1].first, raceCandidates[1].second, isPrimary = false)
                 }
             }
         }
 
         val winner = try {
             winnerFuture.get(timeoutMs, TimeUnit.MILLISECONDS)
-        } catch (_: Throwable) {
-            timedOut.set(true)
+        } catch (e: Throwable) {
+            val isTimeout = e is TimeoutException
+            if (isTimeout) {
+                timedOut.set(true)
+            }
+            raceFinished.set(true)
             winnerClaimed.compareAndSet(false, true)
             winnerFuture.complete(null)
             runCatching { winnerFuture.getNow(null)?.response?.close() }
+            if (isTimeout && !state.evicted.get()) {
+                activeAttempts.forEach { attempt ->
+                    if (attempt.hostPenalized.compareAndSet(false, true)) {
+                        pool.failure(attempt.host, 0L)
+                    }
+                }
+            }
             null
         }
 
         if (winner == null) {
-            timedOut.set(true)
+            raceFinished.set(true)
             synchronized(wakeLock) { wakeLock.notifyAll() }
-            activeCalls.forEach { runCatching { it.cancel() } }
+            activeAttempts.forEach { runCatching { it.call.cancel() } }
             sendError(clientOut, 502, "FLV upstream all hosts failed")
             return false
         }
@@ -1201,7 +1558,7 @@ object BtrLiveEngine {
                     return false
                 }
 
-                RemoteClient.notifyRewrite(
+                notifyRewriteSink(
                     RewriteResult(
                         changed = true,
                         originalUrl = originalUrl,

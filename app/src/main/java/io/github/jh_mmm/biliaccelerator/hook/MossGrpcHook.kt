@@ -18,6 +18,7 @@ import java.util.WeakHashMap
 import java.util.concurrent.Executor
 import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 object MossGrpcHook {
 
@@ -34,11 +35,22 @@ object MossGrpcHook {
     private val inGrpcRefresh = ThreadLocal.withInitial { false }
     private val inHttpRefresh = ThreadLocal.withInitial { false }
 
+    internal data class HttpPlayurlIdentifiers(
+        val cid: Long? = null,
+        val aid: Long? = null,
+        val bvid: String? = null,
+        val epId: Long? = null,
+        val roomId: Long? = null,
+        val isLive: Boolean = false,
+        val isPgc: Boolean = false
+    )
+
     private data class CapturedHttpPlayurlCall(
         val client: Any,
         val request: Any,
         val url: String,
-        val capturedAtMs: Long
+        val capturedAtMs: Long,
+        val ids: HttpPlayurlIdentifiers
     )
 
     private data class CapturedGrpcCallMeta(
@@ -49,6 +61,21 @@ object MossGrpcHook {
 
     private const val MAX_RECENT_HTTP_CALLS = 16
     private const val HTTP_CALL_TTL_MS = 10_000L
+    internal const val SIGNED_HTTP_REPLAY_MAX_AGE_SEC = 600L
+    internal const val SIGNED_HTTP_REPLAY_MAX_AGE_MS = SIGNED_HTTP_REPLAY_MAX_AGE_SEC * 1000L
+    private const val SIGNED_HTTP_MAX_FUTURE_SKEW_SEC = 300L
+
+    @Volatile
+    internal var clockMs: () -> Long = { System.currentTimeMillis() }
+
+    private val JSON_CID_REGEX = Regex(""""cid"\s*:\s*"?(\d+)"?""")
+    private val JSON_AID_REGEX = Regex(""""(?:aid|avid)"\s*:\s*"?(\d+)"?""")
+    private val JSON_BVID_REGEX = Regex(""""bvid"\s*:\s*"(BV[0-9A-Za-z]+)"""")
+    private val JSON_EP_ID_REGEX = Regex(""""(?:ep_id|epid|episode_id)"\s*:\s*"?(\d+)"?""")
+    private val JSON_ROOM_ID_REGEX = Regex(""""room_id"\s*:\s*"?(\d+)"?""")
+    private val JSON_CODE_REGEX = Regex(""""code"\s*:\s*(-?\d+)""")
+    private val URL_UPGCXCODE_CID_REGEX = Regex("""/upgcxcode/[^/]+/[^/]+/(\d{5,})/""", RegexOption.IGNORE_CASE)
+    private val URL_FILENAME_CID_REGEX = Regex("""/(\d{5,})-\d+-\d+\.(?:m4s|mp4)""", RegexOption.IGNORE_CASE)
 
     private val recentCallsLock = Any()
     private val recentCapturedCalls = ArrayDeque<CapturedHttpPlayurlCall>()
@@ -68,7 +95,10 @@ object MossGrpcHook {
         "com.bapis.bilibili.app.playerunite.v1.PlayViewUniteReply",
         "com.bapis.bilibili.pgc.gateway.player.v2.PlayViewReply",
         "com.bapis.bilibili.pgc.gateway.player.v1.PlayViewReply",
-        "com.bapis.bilibili.app.playurl.v1.PlayURLReply"
+        "com.bapis.bilibili.app.playurl.v1.PlayURLReply",
+        "com.bapis.bilibili.live.xroom.v1.RoomPlayInfoReply",
+        "com.bapis.bilibili.live.app.room.v1.RoomPlayInfoReply",
+        "com.bapis.bilibili.live.xroom.v2.PlayInfoReply"
     )
 
     fun init(module: XposedModule, classLoader: ClassLoader) {
@@ -196,6 +226,7 @@ object MossGrpcHook {
         requestToCapturedCall.clear()
         bodyToCapturedCall.clear()
         clientCallToMeta.clear()
+        clockMs = { System.currentTimeMillis() }
     }
 
     internal fun hasCapturedHttpPlayurlCallForTesting(): Boolean {
@@ -216,7 +247,8 @@ object MossGrpcHook {
             PlayinfoRegistry.ingestPlayViewReply(
                 reply,
                 sourceTag = sourceTag,
-                refreshCallback = refreshCallback
+                refreshCallback = refreshCallback,
+                refreshSource = PlayinfoRegistry.RefreshSource.GRPC
             ).isNotEmpty()
         } catch (_: Throwable) {
             false
@@ -249,8 +281,84 @@ object MossGrpcHook {
         }
     }
 
+    internal fun extractUrlPlayurlIdentifiers(url: String): HttpPlayurlIdentifiers {
+        val parsed = BiliAcceleratorCore.parseUri(url) ?: return HttpPlayurlIdentifiers()
+        val pathLower = parsed.path.lowercase()
+        val cid = parsed.queryParam("cid")?.toLongOrNull()?.takeIf { it > 0L }
+        val aid = (parsed.queryParam("avid") ?: parsed.queryParam("aid"))?.toLongOrNull()?.takeIf { it > 0L }
+        val bvid = parsed.queryParam("bvid")?.trim()?.takeIf { it.startsWith("BV", ignoreCase = true) }
+        val epId = (parsed.queryParam("ep_id") ?: parsed.queryParam("epid") ?: parsed.queryParam("episode_id"))
+            ?.toLongOrNull()?.takeIf { it > 0L }
+        val isLive = pathLower.contains("getroomplayinfo") || pathLower.contains("/roomplayinfo")
+        val roomId = if (isLive) {
+            (parsed.queryParam("room_id") ?: parsed.queryParam("id"))?.toLongOrNull()?.takeIf { it > 0L }
+        } else {
+            parsed.queryParam("room_id")?.toLongOrNull()?.takeIf { it > 0L }
+        }
+        val isPgc = epId != null ||
+            pathLower.contains("/pgc/") ||
+            pathLower.contains("/ogv/") ||
+            pathLower.contains("/bangumi/")
+        return HttpPlayurlIdentifiers(
+            cid = cid,
+            aid = aid,
+            bvid = bvid,
+            epId = epId,
+            roomId = roomId,
+            isLive = isLive,
+            isPgc = isPgc
+        )
+    }
+
+    internal fun extractJsonPlayurlIdentifiers(jsonText: String): HttpPlayurlIdentifiers {
+        val cid = JSON_CID_REGEX.find(jsonText)?.groupValues?.getOrNull(1)?.toLongOrNull()?.takeIf { it > 0L }
+            ?: URL_UPGCXCODE_CID_REGEX.find(jsonText)?.groupValues?.getOrNull(1)?.toLongOrNull()?.takeIf { it > 0L }
+            ?: URL_FILENAME_CID_REGEX.find(jsonText)?.groupValues?.getOrNull(1)?.toLongOrNull()?.takeIf { it > 0L }
+        val aid = JSON_AID_REGEX.find(jsonText)?.groupValues?.getOrNull(1)?.toLongOrNull()?.takeIf { it > 0L }
+        val bvid = JSON_BVID_REGEX.find(jsonText)?.groupValues?.getOrNull(1)?.takeIf { it.isNotBlank() }
+        val epId = JSON_EP_ID_REGEX.find(jsonText)?.groupValues?.getOrNull(1)?.toLongOrNull()?.takeIf { it > 0L }
+        val roomId = JSON_ROOM_ID_REGEX.find(jsonText)?.groupValues?.getOrNull(1)?.toLongOrNull()?.takeIf { it > 0L }
+        val isLive = jsonText.contains("\"playurl_info\"") && jsonText.contains("\"url_info\"")
+        val isPgc = epId != null ||
+            jsonText.contains("\"ogv_episode_info\"") ||
+            jsonText.contains("\"ogv_season_info\"") ||
+            jsonText.contains("/pgc/", ignoreCase = true) ||
+            jsonText.contains("/ogv/", ignoreCase = true) ||
+            jsonText.contains("/bangumi/", ignoreCase = true)
+        return HttpPlayurlIdentifiers(
+            cid = cid,
+            aid = aid,
+            bvid = bvid,
+            epId = epId,
+            roomId = roomId,
+            isLive = isLive,
+            isPgc = isPgc
+        )
+    }
+
+    private fun conflictsHttpPlayurlIdentifiers(req: HttpPlayurlIdentifiers, resp: HttpPlayurlIdentifiers): Boolean {
+        if (req.isLive != resp.isLive) return true
+        if (!req.isPgc && resp.isPgc) return true
+        if (req.cid != null && resp.cid != null && req.cid != resp.cid) return true
+        if (req.epId != null && resp.epId != null && req.epId != resp.epId) return true
+        if (req.aid != null && resp.aid != null && req.aid != resp.aid) return true
+        if (req.bvid != null && resp.bvid != null && !req.bvid.equals(resp.bvid, ignoreCase = true)) return true
+        if (req.roomId != null && resp.roomId != null && req.roomId != resp.roomId) return true
+        return false
+    }
+
+    private fun hasExplicitIdentifierMatch(req: HttpPlayurlIdentifiers, resp: HttpPlayurlIdentifiers): Boolean {
+        if (req.cid != null && resp.cid != null && req.cid == resp.cid) return true
+        if (req.epId != null && resp.epId != null && req.epId == resp.epId) return true
+        if (req.aid != null && resp.aid != null && req.aid == resp.aid) return true
+        if (req.bvid != null && resp.bvid != null && req.bvid.equals(resp.bvid, ignoreCase = true)) return true
+        if (req.roomId != null && resp.roomId != null && req.roomId == resp.roomId) return true
+        return false
+    }
+
     private fun consumeMatchingHttpCaller(
         bodyObj: Any?,
+        jsonText: String,
         nowMs: Long
     ): CapturedHttpPlayurlCall? {
         if (bodyObj != null) {
@@ -265,15 +373,38 @@ object MossGrpcHook {
                 if (ageMs in 0L..HTTP_CALL_TTL_MS) {
                     return bound
                 }
+                return null
             }
         }
+        val respIds = extractJsonPlayurlIdentifiers(jsonText)
         return synchronized(recentCallsLock) {
             pruneExpiredHttpCallsLocked(nowMs)
-            val recent = if (recentCapturedCalls.isNotEmpty()) recentCapturedCalls.removeLast() else null
-            if (recent != null) {
-                requestToCapturedCall.remove(recent.request)
+            if (recentCapturedCalls.isEmpty()) return@synchronized null
+
+            // 1. Prefer an exact identifier match (cid / ep_id / avid / bvid / room_id) with zero conflicts
+            val exactIdx = recentCapturedCalls.indexOfLast { cand ->
+                !conflictsHttpPlayurlIdentifiers(cand.ids, respIds) &&
+                    hasExplicitIdentifierMatch(cand.ids, respIds)
             }
-            recent
+            if (exactIdx >= 0) {
+                val matched = recentCapturedCalls.removeAt(exactIdx)
+                requestToCapturedCall.remove(matched.request)
+                return@synchronized matched
+            }
+
+            // 2. Never blindly pop when a specific ResponseBody was passed without binding/ID match,
+            //    or when multiple concurrent calls are in flight without an explicit ID match.
+            if (bodyObj != null || recentCapturedCalls.size > 1) {
+                return@synchronized null
+            }
+
+            val only = recentCapturedCalls.first()
+            if (conflictsHttpPlayurlIdentifiers(only.ids, respIds)) {
+                return@synchronized null
+            }
+            recentCapturedCalls.removeFirst()
+            requestToCapturedCall.remove(only.request)
+            only
         }
     }
 
@@ -322,12 +453,13 @@ object MossGrpcHook {
         if (!fastLooksLikePlayinfoJson(text)) return false
         inPlayinfoInspect.set(true)
         return try {
-            val recentCaller = if (allowRefreshCallback) consumeMatchingHttpCaller(bodyObj, nowMs) else null
+            val recentCaller = if (allowRefreshCallback) consumeMatchingHttpCaller(bodyObj, text, nowMs) else null
             val recentRefreshCb = recentCaller?.let { buildHttpRefreshCallback(it) }
             PlayinfoRegistry.ingestJson(
                 text,
                 sourceUrl = recentCaller?.url.orEmpty(),
-                refreshCallback = recentRefreshCb
+                refreshCallback = recentRefreshCb,
+                refreshSource = PlayinfoRegistry.RefreshSource.HTTP
             ).isNotEmpty()
         } catch (_: Throwable) {
             false
@@ -346,7 +478,7 @@ object MossGrpcHook {
         val methodStr = runCatching { invokeZeroArgAccessible(req, "method")?.toString() }.getOrNull()
         val urlStr = runCatching { invokeZeroArgAccessible(req, "url")?.toString() }.getOrNull()
         if (methodStr.equals("GET", ignoreCase = true) && urlStr != null && isPlayurlApiUrl(urlStr)) {
-            val captured = CapturedHttpPlayurlCall(client, req, urlStr, nowMs)
+            val captured = CapturedHttpPlayurlCall(client, req, urlStr, nowMs, extractUrlPlayurlIdentifiers(urlStr))
             requestToCapturedCall[req] = captured
             synchronized(recentCallsLock) {
                 pruneExpiredHttpCallsLocked(nowMs)
@@ -484,7 +616,9 @@ object MossGrpcHook {
             invokeZeroArgAccessible(methodDesc, "getFullMethodName")?.toString()
         }.getOrNull().orEmpty()
         return fullMethodName.contains("PlayView", ignoreCase = true) ||
-            fullMethodName.contains("PlayURL", ignoreCase = true)
+            fullMethodName.contains("PlayURL", ignoreCase = true) ||
+            fullMethodName.contains("RoomPlayInfo", ignoreCase = true) ||
+            (fullMethodName.contains("xroom", ignoreCase = true) && fullMethodName.contains("PlayInfo", ignoreCase = true))
     }
 
     internal fun recordClientCallMetaForTesting(
@@ -795,9 +929,47 @@ object MossGrpcHook {
         return anyHooked
     }
 
+    private fun parseEpochSeconds(raw: String?): Long? {
+        val v = raw?.trim()?.toLongOrNull() ?: return null
+        if (v <= 0L) return null
+        return if (v >= 10_000_000_000L) v / 1000L else v
+    }
+
+    /**
+     * 检查捕获的 HTTP playurl 请求是否仍处于签名有效窗口内，避免重放带过期 ts/sign 或 WBI wts/w_rid 的旧请求触发 403/412。
+     */
+    internal fun isCapturedHttpRequestFreshForReplay(
+        url: String,
+        capturedAtMs: Long,
+        nowMs: Long = clockMs()
+    ): Boolean {
+        val parsed = BiliAcceleratorCore.parseUri(url) ?: return false
+        val wtsSec = parseEpochSeconds(parsed.queryParam("wts"))
+        val tsSec = parseEpochSeconds(parsed.queryParam("ts"))
+        val signedTsSec = wtsSec ?: tsSec
+        val hasSignature = !parsed.queryParam("sign").isNullOrBlank() ||
+            !parsed.queryParam("w_rid").isNullOrBlank()
+        if (signedTsSec != null) {
+            val nowSec = nowMs / 1000L
+            val ageSec = nowSec - signedTsSec
+            return ageSec in -SIGNED_HTTP_MAX_FUTURE_SKEW_SEC..SIGNED_HTTP_REPLAY_MAX_AGE_SEC
+        }
+        if (hasSignature) {
+            val ageMs = nowMs - capturedAtMs
+            return ageMs in 0L..SIGNED_HTTP_REPLAY_MAX_AGE_MS
+        }
+        return true
+    }
+
     private fun buildHttpRefreshCallback(caller: CapturedHttpPlayurlCall): PlayinfoRefreshCallback {
+        val invalidated = AtomicBoolean(false)
         return PlayinfoRefreshCallback {
             if (!RemoteClient.getCachedConfig().enabled) return@PlayinfoRefreshCallback false
+            if (invalidated.get()) return@PlayinfoRefreshCallback false
+            if (!isCapturedHttpRequestFreshForReplay(caller.url, caller.capturedAtMs, clockMs())) {
+                invalidated.set(true)
+                return@PlayinfoRefreshCallback false
+            }
             if (inHttpRefresh.get() == true) return@PlayinfoRefreshCallback false
             inHttpRefresh.set(true)
             try {
@@ -810,6 +982,13 @@ object MossGrpcHook {
                 val callObj = newCall.invoke(caller.client, caller.request) ?: return@PlayinfoRefreshCallback false
                 val respObj = invokeZeroArgAccessible(callObj, "execute") ?: return@PlayinfoRefreshCallback false
                 try {
+                    val statusCode = runCatching {
+                        (invokeZeroArgAccessible(respObj, "code") as? Number)?.toInt()
+                    }.getOrNull()
+                    if (statusCode == 401 || statusCode == 403 || statusCode == 412) {
+                        invalidated.set(true)
+                        return@PlayinfoRefreshCallback false
+                    }
                     val isSuccessful = runCatching {
                         invokeZeroArgAccessible(respObj, "isSuccessful") as? Boolean
                     }.getOrNull() ?: true
@@ -817,7 +996,16 @@ object MossGrpcHook {
                     val bodyObj = invokeZeroArgAccessible(respObj, "body") ?: return@PlayinfoRefreshCallback false
                     val bodyText = invokeZeroArgAccessible(bodyObj, "string") as? String
                         ?: return@PlayinfoRefreshCallback false
-                    PlayinfoRegistry.ingestJson(bodyText, sourceUrl = caller.url).isNotEmpty()
+                    val apiCode = JSON_CODE_REGEX.find(bodyText)?.groupValues?.getOrNull(1)?.toIntOrNull()
+                    if (apiCode == -3 || apiCode == -101 || apiCode == -403 || apiCode == -412) {
+                        invalidated.set(true)
+                        return@PlayinfoRefreshCallback false
+                    }
+                    PlayinfoRegistry.ingestJson(
+                        bodyText,
+                        sourceUrl = caller.url,
+                        refreshSource = PlayinfoRegistry.RefreshSource.HTTP
+                    ).isNotEmpty()
                 } finally {
                     runCatching { invokeZeroArgAccessible(respObj, "close") }
                 }
@@ -836,10 +1024,14 @@ object MossGrpcHook {
         if (trimmedStart !in 0..16) return false
         val hasTrackField = text.contains("\"dash\"") || text.contains("\"durl\"") ||
             text.contains("\"support_formats\"") || text.contains("\"video_info\"") ||
-            text.contains("\"vod_info\"") || text.contains("\"stream_list\"")
+            text.contains("\"vod_info\"") || text.contains("\"stream_list\"") ||
+            (text.contains("\"playurl_info\"") && text.contains("\"url_info\""))
         if (!hasTrackField) return false
         return text.contains("bilivideo") || text.contains("bstarstatic") ||
             text.contains("akamaized") || text.contains("upgcxcode") ||
+            text.contains("mountaintoys") || text.contains("szbdyd") ||
+            text.contains("nexusedgeio") || text.contains("ahdohpiechei") ||
+            text.contains("mcdn") ||
             text.contains("is_drm") || text.contains("drm_tech_type") ||
             text.contains("is_preview")
     }
@@ -847,7 +1039,7 @@ object MossGrpcHook {
     internal fun isPlayurlApiUrl(url: String): Boolean {
         if (!url.startsWith("http", ignoreCase = true)) return false
         val parsed = BiliAcceleratorCore.parseUri(url) ?: return false
-        val host = parsed.host.lowercase()
+        val host = BiliAcceleratorCore.normalizeHost(parsed.host)
         val isBiliApiHost = host == "bilibili.com" || host.endsWith(".bilibili.com") ||
             host == "biliapi.net" || host.endsWith(".biliapi.net") ||
             host == "biliapi.com" || host.endsWith(".biliapi.com") ||
@@ -855,13 +1047,17 @@ object MossGrpcHook {
             host == "bilibili.tv" || host.endsWith(".bilibili.tv")
         return isBiliApiHost && (
             parsed.path.contains("/playurl", ignoreCase = true) ||
-                parsed.path.contains("/playview", ignoreCase = true)
+                parsed.path.contains("/playview", ignoreCase = true) ||
+                parsed.path.contains("getRoomPlayInfo", ignoreCase = true) ||
+                parsed.path.contains("/roomplayinfo", ignoreCase = true)
             )
     }
 
     internal fun looksLikePlayViewObject(obj: Any): Boolean {
         val name = obj.javaClass.name
-        return name.contains("PlayView", ignoreCase = true) || name.contains("PlayURL", ignoreCase = true)
+        return name.contains("PlayView", ignoreCase = true) || name.contains("PlayURL", ignoreCase = true) ||
+            name.contains("RoomPlayInfo", ignoreCase = true) ||
+            (name.contains(".live.", ignoreCase = true) && name.contains("PlayInfo", ignoreCase = true))
     }
 
     internal fun shouldIntercept(config: AcceleratorConfig, result: Any?): Boolean {

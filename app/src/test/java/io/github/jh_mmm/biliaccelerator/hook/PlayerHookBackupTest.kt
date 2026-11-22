@@ -246,21 +246,38 @@ class PlayerHookBackupTest {
     }
 
     @Test
-    fun testUpdateBackupsPreservesSynthesizedMirrorsWhenAkamaiOnlyBackupsArriveWithNullConfig() {
+    fun testUpdateBackupsPreservesSynthesizedMirrorsWhenAkamaiOnlyBackupsArriveWithRewriteAkamaiEnabled() {
         val akamaiUrl = "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/77/88/55555.m4s?deadline=1899999999"
-        val sid = BtrSessionManager.register(primaryUrl = akamaiUrl, backupUrls = emptyList(), config = null)
-        val initialSession = BtrSessionManager.get(sid)!!
-        assertTrue("Synthesized mirrors must be populated for Akamai even when config is null", initialSession.synthesizedMirrors.isNotEmpty())
+        // Issue 11: Akamai without hdnts= must NOT synthesize UPOS mirrors when config is null / rewriteAkamai=false
+        val nullCfgSid = BtrSessionManager.register(primaryUrl = akamaiUrl, backupUrls = emptyList(), config = null)
+        try {
+            val nullCfgSession = BtrSessionManager.get(nullCfgSid)!!
+            assertTrue(
+                "Akamai URL without hdnts= must NOT synthesize UPOS mirrors when config is null",
+                nullCfgSession.synthesizedMirrors.isEmpty()
+            )
+        } finally {
+            BtrSessionManager.remove(nullCfgSid)
+        }
 
-        val newAkamaiBackup = listOf("https://upos-sz-mirrorakam.akamaized.net/upgcxcode/77/88/55555.m4s?deadline=1899999999")
-        BtrSessionManager.updateBackups(sid, newAkamaiBackup)
-        val updatedBackups = BtrSessionManager.get(sid)!!.backupUrls
-        assertTrue("New Akamai backup must be included", updatedBackups.containsAll(newAkamaiBackup))
-        assertTrue(
-            "Synthesized UPOS mirrors must stay preserved when player only supplies Akamai backups",
-            updatedBackups.any { it.contains("bilivideo.com") }
-        )
-        BtrSessionManager.remove(sid)
+        // With BTR + rewriteAkamai enabled, synthesized UPOS mirrors must be populated and preserved across Akamai-only backup updates
+        val akamaiBtrConfig = config.copy(enableBtr = true, rewriteAkamai = true)
+        val sid = BtrSessionManager.register(primaryUrl = akamaiUrl, backupUrls = emptyList(), config = akamaiBtrConfig)
+        try {
+            val initialSession = BtrSessionManager.get(sid)!!
+            assertTrue("Synthesized mirrors must be populated for Akamai when BTR + rewriteAkamai enabled", initialSession.synthesizedMirrors.isNotEmpty())
+
+            val newAkamaiBackup = listOf("https://upos-sz-mirrorakam.akamaized.net/upgcxcode/77/88/55555.m4s?deadline=1899999999")
+            BtrSessionManager.updateBackups(sid, newAkamaiBackup)
+            val updatedBackups = BtrSessionManager.get(sid)!!.backupUrls
+            assertTrue("New Akamai backup must be included", updatedBackups.containsAll(newAkamaiBackup))
+            assertTrue(
+                "Synthesized UPOS mirrors must stay preserved when player only supplies Akamai backups",
+                updatedBackups.any { it.contains("bilivideo.com") }
+            )
+        } finally {
+            BtrSessionManager.remove(sid)
+        }
     }
 
     @Test
@@ -811,7 +828,7 @@ class PlayerHookBackupTest {
         val akamaiUrl = "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/54/12/94001.m4s?hdnts=exp=1899999999~hmac=sig"
         val btrAkamaiCfg = config.copy(enableBtr = true, rewriteAkamai = true)
 
-        // 1. No clean UPOS donor: must keep original signed Akamai primaryUrl instead of sending hdnts= to UPOS
+        // 1. All-Akamai (no non-Akamai donor): Akamai acts as donor under BTR+rewriteAkamai
         val setBackupMethod = FakeSegmentBuilder::class.java.getMethod("setBackupUrls", List::class.java)
         val builder1 = FakeSegmentBuilder()
         @Suppress("UNCHECKED_CAST")
@@ -829,11 +846,10 @@ class PlayerHookBackupTest {
         val sid1 = BtrSessionManager.getSessionForBuilder(builder1)!!
         try {
             val session1 = BtrSessionManager.get(sid1)!!
-            assertEquals("Without clean UPOS donor, primaryUrl must remain Akamai", akamaiUrl, session1.primaryUrl)
-            assertTrue(
-                "Session backups must never carry hdnts= onto non-Akamai UPOS hosts",
-                session1.backupUrls.none { !it.contains("akamaized.net") && it.contains("hdnts=") }
-            )
+            // All-Akamai (对齐上游 cdn-resolver)：Akamai 地址作为 donor 合成 UPOS 镜像，原 Akamai 保留为回退
+            assertTrue("All-Akamai: primary becomes UPOS node", session1.primaryUrl.contains("bilivideo.com"))
+            assertTrue("Original Akamai kept as fallback", session1.backupUrls.contains(akamaiUrl))
+            assertTrue("UPOS mirrors synthesized from Akamai donor", session1.backupUrls.any { it.contains("mirrorali.bilivideo.com") })
         } finally {
             BtrSessionManager.remove(sid1)
         }
@@ -1014,5 +1030,459 @@ class PlayerHookBackupTest {
             onRewrite = null
         )
         assertEquals(cleanOfficial, nonBtrArgs?.get(0))
+    }
+}
+
+
+class PlayerHookLiveAndAkamaiTest {
+
+    private val btrConfig = AcceleratorConfig(
+        enabled = true,
+        targetHost = "upos-sz-mirrorcos.bilivideo.com",
+        blockPcdn = true,
+        enableBtr = true,
+        rewriteAkamai = true,
+        btrCdnPoolSize = 5
+    )
+
+    @After
+    fun tearDown() {
+        PlayinfoRegistry.resetForTesting()
+    }
+
+    @Test
+    fun testAllAkamaiDonorSynthesizesUposMirrorsAndKeepsAkamaiFallback() {
+        val akamai = "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/54/12/34567.m4s?hdnts=exp=4102444800~hmac=abc"
+        val sid = BtrSessionManager.register(
+            primaryUrl = akamai,
+            backupUrls = listOf("https://other.akamaized.net/upgcxcode/54/12/34567.m4s?hdnts=exp=4102444800~hmac=def"),
+            isAudio = false,
+            config = btrConfig
+        )
+        val session = BtrSessionManager.get(sid)!!
+        assertTrue("UPOS mirrors synthesized from Akamai donor", session.backupUrls.any { it.contains("mirrorali.bilivideo.com") })
+        assertTrue(session.backupUrls.any { it.contains("hdnts=exp=4102444800~hmac=def") })
+    }
+
+    @Test
+    fun testAkamaiDonorDisabledWithoutRewriteAkamai() {
+        val akamai = "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/54/12/34567.m4s?hdnts=exp=4102444800~hmac=abc"
+        val cfg = btrConfig.copy(rewriteAkamai = false)
+        val sid = BtrSessionManager.register(primaryUrl = akamai, backupUrls = emptyList(), isAudio = false, config = cfg)
+        val session = BtrSessionManager.get(sid)!!
+        assertTrue(session.backupUrls.none { it.contains("bilivideo.com") })
+    }
+
+    @Test
+    fun testIsAllAkamaiDonorCaseRespectsNonAkamaiDonor() {
+        val akamai = "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/54/12/34567.m4s?hdnts=exp=4102444800~hmac=abc"
+        val cleanUpos = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/34567.m4s?e=1&uipk=5"
+        assertTrue(PlayerHook.isAllAkamaiDonorCase(btrConfig, akamai, emptyList(), listOf(akamai)))
+        assertFalse(PlayerHook.isAllAkamaiDonorCase(btrConfig, akamai, listOf(cleanUpos), emptyList()))
+        assertFalse(PlayerHook.isAllAkamaiDonorCase(btrConfig.copy(rewriteAkamai = false), akamai, emptyList(), emptyList()))
+    }
+
+    @Test
+    fun testLiveBackupsLookupFromRoomPlayInfoKeepsExtraAuth() {
+        val json = """{"code":0,"data":{"playurl_info":{"playurl":{"stream":[{"protocol_name":"http_stream","format":[{"format_name":"flv","codec":[{"codec_name":"avc","base_url":"/live-bvc/123/live_1_2.flv?","url_info":[
+            {"host":"https://cn-gotcha01.bilivideo.com","extra":"expires=1&sign=a"},
+            {"host":"https://1.2.3.4:4483","extra":"expires=1&sign=pcdn"},
+            {"host":"https://cn-gotcha04.bilivideo.com","extra":"expires=1&sign=b"},
+            {"host":"https://xy1x.mcdn.bilivideo.cn","extra":"expires=1&sign=m"}]}]}]}]}}}}"""
+        PlayinfoRegistry.ingestJson(json)
+        val primary = "https://cn-gotcha01.bilivideo.com/live-bvc/123/live_1_2.flv?expires=1&sign=a"
+        val backups = PlayinfoRegistry.lookupLiveBackups(primary)
+        assertEquals(listOf("https://cn-gotcha04.bilivideo.com/live-bvc/123/live_1_2.flv?expires=1&sign=b"), backups)
+    }
+
+    @Test
+    fun testVodSchedulerXyUsourceRecovered() {
+        val sched = "https://xy1x.mountaintoys.cn/upgcxcode/54/12/34567.m4s?xy_usource=cn-gotcha01.bilivideo.com&e=1"
+        val recovered = PlayinfoRegistry.recoverSchedulerSourceUrl(sched)
+        assertEquals("https://cn-gotcha01.bilivideo.com/upgcxcode/54/12/34567.m4s?xy_usource=cn-gotcha01.bilivideo.com&e=1", recovered)
+        assertNull(PlayinfoRegistry.recoverSchedulerSourceUrl("https://xy1x.szbdyd.com/upgcxcode/a.m4s?os=mcdn&xy_usource=cn-gotcha01.bilivideo.com"))
+        assertNull(PlayinfoRegistry.recoverSchedulerSourceUrl("https://xy1x.szbdyd.com/upgcxcode/a.m4s?xy_usource=evil.example.com"))
+    }
+}
+
+
+class PlayerHookAutoVodAndEdgeCasesTest {
+
+    private class FakeBuilder {
+        var backups: List<String> = emptyList()
+        fun setBackupUrls(list: List<String>): FakeBuilder {
+            backups = list
+            return this
+        }
+    }
+
+    private class FakeBuiltSegment(val url: String)
+    private class FakeMediaAsset(val segments: List<FakeBuiltSegment>)
+
+    private class FakeIjkPlayer(
+        private val durationMs: Long = -1L,
+        private val positionMs: Long = -1L,
+        private val cachedDurationMs: Long = -1L,
+        private val tcpSpeedBytesPerSec: Long = 0L
+    ) {
+        fun getDuration(): Long = durationMs
+        fun getCurrentPosition(): Long = positionMs
+        fun getVideoCachedDuration(): Long = cachedDurationMs
+        fun getTcpSpeed(): Long = tcpSpeedBytesPerSec
+    }
+
+    private class RecordingConcurrencySink : io.github.jh_mmm.biliaccelerator.btr.PlayerConcurrencySink {
+        var stallCount = 0
+        var bufferHungerCount = 0
+        var slowCount = 0
+        override fun onStall(nowMs: Long) { stallCount++ }
+        override fun onBufferHunger(bufferedBytes: Long, nowMs: Long) { bufferHungerCount++ }
+        override fun onSlow(nowMs: Long) { slowCount++ }
+    }
+
+    @After
+    fun tearDown() {
+        io.github.jh_mmm.biliaccelerator.core.AutoVodRouter.resetForTesting()
+        BtrLocalProxyServer.stop()
+        PlayinfoRegistry.resetForTesting()
+        RemoteClient.setCachedConfigForTesting(AcceleratorConfig(enabled = true), 0L)
+    }
+
+    @Test
+    fun testIssue2AutoModeDoesNotOverwriteHealthyOfficialNodeEvenWithForceUposTrue() {
+        val autoForceCfg = AcceleratorConfig(
+            enabled = true,
+            enableBtr = false,
+            selectionMode = "auto",
+            forceUpos = true,
+            targetHost = "upos-sz-mirrorcos.bilivideo.com",
+            blockPcdn = true,
+            proxyMcdn = true
+        )
+        val healthyOverseas = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/12/34/100001-1-30080.m4s?deadline=1899999999"
+        val builder = FakeBuilder()
+        val mainRes = PlayerHook.rewriteArgIfMedia(
+            args = listOf(healthyOverseas),
+            builderInstance = builder,
+            configOverride = autoForceCfg,
+            onRewrite = null
+        )
+        assertNull("Auto mode must keep healthy official/overseas node untouched even when forceUpos=true", mainRes)
+
+        val fallbackRes = PlayerHook.rewriteFallbackDataSource(
+            original = healthyOverseas,
+            playerInstance = Any(),
+            configOverride = autoForceCfg,
+            onRewrite = null
+        )
+        assertNull("Fallback dataSource in auto mode must keep healthy official/overseas node untouched", fallbackRes)
+    }
+
+    @Test
+    fun testIssue2InterceptSetBackupUrlsUsesEffectiveConfigAndPrioritizesWinner() {
+        val autoForceCfg = AcceleratorConfig(
+            enabled = true,
+            enableBtr = false,
+            selectionMode = "auto",
+            forceUpos = true,
+            targetHost = "upos-sz-mirrorcos.bilivideo.com",
+            blockPcdn = true,
+            proxyMcdn = true
+        )
+        io.github.jh_mmm.biliaccelerator.core.AutoVodRouter.setSynchronousRaceForTesting(true)
+        io.github.jh_mmm.biliaccelerator.core.AutoVodRouter.setRandomProviderForTesting { 0.99 }
+
+        val cosov = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/12/34/200001-1-30080.m4s?deadline=1899999999"
+        val ali = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/12/34/200001-1-30080.m4s?deadline=1899999999"
+        val hw = "https://upos-sz-mirrorhw.bilivideo.com/upgcxcode/12/34/200001-1-30080.m4s?deadline=1899999999"
+
+        // Seed AutoVodRouter history so HW ranks above ALI and COSOV
+        io.github.jh_mmm.biliaccelerator.core.AutoVodRouter.selectVodUrl(
+            originalUrl = cosov,
+            rawBackups = listOf(ali, hw),
+            config = autoForceCfg,
+            nowMs = 1000L
+        )
+        io.github.jh_mmm.biliaccelerator.core.AutoVodRouter.configureRangeFetcher { url, _, _, _ ->
+            val host = io.github.jh_mmm.biliaccelerator.core.AutoVodRouter.hostOf(url)
+            val ms = if (host.contains("mirrorhw")) 300L else 1800L
+            io.github.jh_mmm.biliaccelerator.core.AutoVodRouter.RangeFetchResponse(
+                status = 206,
+                bytes = io.github.jh_mmm.biliaccelerator.core.AutoVodRouter.RACE_BYTES,
+                durationMs = ms
+            )
+        }
+        io.github.jh_mmm.biliaccelerator.core.AutoVodRouter.reportPlayerStall(
+            urlOrHost = cosov,
+            bufferAheadS = 0.0,
+            config = autoForceCfg,
+            nowMs = 2000L,
+            immediate = true
+        )
+
+        val builder = FakeBuilder()
+        val setBackupMethod = FakeBuilder::class.java.getMethod("setBackupUrls", List::class.java)
+        val rawBackups = listOf(cosov, ali, hw)
+        @Suppress("UNCHECKED_CAST")
+        PlayerHook.interceptSetBackupUrls(
+            builder = builder,
+            method = setBackupMethod,
+            rawArg = rawBackups,
+            config = autoForceCfg,
+            onRewrite = null,
+            proceedOriginal = { builder.setBackupUrls(rawBackups) },
+            proceedWithArg = { arg -> builder.setBackupUrls(arg as List<String>) }
+        )
+
+        assertTrue("Auto mode must NOT overwrite mirrorcosov backup with targetHost (mirrorcos)", builder.backups.contains(cosov))
+        assertEquals("Race winner (mirrorhw) must be prioritized first in backups", hw, builder.backups.firstOrNull())
+    }
+
+    @Test
+    fun testIssue4FindPromotableOfficialBackupUnwrapsSchedulerBackup() {
+        val nowSec = System.currentTimeMillis() / 1000L
+        val mcdnPrimary = "https://xy1x2x3x4xy.mcdn.bilivideo.cn/upgcxcode/54/12/300001.m4s?os=mcdn&deadline=${nowSec + 3600}"
+        val schedulerBackup = "https://xy1x.mountaintoys.cn/upgcxcode/54/12/300001.m4s?xy_usource=upos-sz-mirrorali.bilivideo.com&deadline=${nowSec + 3600}"
+        val expectedUnwrapped = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/300001.m4s?xy_usource=upos-sz-mirrorali.bilivideo.com&deadline=${nowSec + 3600}"
+
+        val cfg = AcceleratorConfig(enabled = true, enableBtr = false, selectionMode = "manual", proxyMcdn = true)
+        val rawResult = io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore.rewriteUrl(mcdnPrimary, cfg)
+        val promoted = PlayerHook.findPromotableOfficialBackup(
+            originalUrl = mcdnPrimary,
+            result = rawResult,
+            rawBackups = listOf(schedulerBackup),
+            isLive = false
+        )
+        assertEquals("Scheduler backup must be unwrapped via extractSchedulerSourceUrl before promotion", expectedUnwrapped, promoted)
+    }
+
+    @Test
+    fun testIssue9IjkPlayerAssetBindingTargetsExactSessionWithoutBroadcasting() {
+        val btrCfg = AcceleratorConfig(enabled = true, enableBtr = true, targetHost = "upos-sz-mirrorcos.bilivideo.com")
+        val urlA = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/10/20/400001-1-30080.m4s?deadline=1899999999"
+        val urlB = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/10/20/400002-1-30080.m4s?deadline=1899999999"
+        val builderA = FakeBuilder()
+        val builderB = FakeBuilder()
+
+        val resA = PlayerHook.rewriteArgIfMedia(listOf(urlA), builderA, btrCfg, onRewrite = null)
+        val resB = PlayerHook.rewriteArgIfMedia(listOf(urlB), builderB, btrCfg, onRewrite = null)
+        val btrUrlA = resA?.get(0) as String
+        val btrUrlB = resB?.get(0) as String
+        val sidA = BtrSessionManager.getSessionForBuilder(builderA)!!
+        val sidB = BtrSessionManager.getSessionForBuilder(builderB)!!
+
+        val sinkA = RecordingConcurrencySink()
+        val sinkB = RecordingConcurrencySink()
+        BtrSessionManager.get(sidA)!!.concurrencyController = sinkA
+        BtrSessionManager.get(sidB)!!.concurrencyController = sinkB
+
+        try {
+            val segA = FakeBuiltSegment(btrUrlA)
+            val segB = FakeBuiltSegment(btrUrlB)
+            PlayerHook.onSegmentBuilt(builderA, segA)
+            PlayerHook.onSegmentBuilt(builderB, segB)
+
+            val playerA = FakeIjkPlayer(cachedDurationMs = 1200L)
+            val playerB = FakeIjkPlayer(durationMs = 3_600_000L, positionMs = 0L)
+            PlayerHook.bindPlayerToAsset(playerA, FakeMediaAsset(listOf(segA)))
+            PlayerHook.bindPlayerToAsset(playerB, FakeMediaAsset(listOf(segB)))
+
+            assertEquals(sidA, PlayerHook.resolvePlayerSessionId(playerA))
+            assertEquals(sidB, PlayerHook.resolvePlayerSessionId(playerB))
+
+            // Stall on playerA must notify ONLY sidA, never broadcast to sidB
+            PlayerHook.handlePlayerInfoEvent(playerA, what = 701, extra = 0, config = btrCfg)
+            assertEquals(1, sinkA.stallCount)
+            assertEquals(0, sinkB.stallCount)
+
+            // Low cached duration (1.2s < 3s) on playerA notifies ONLY sidA
+            PlayerHook.handlePlayerBufferingUpdate(playerA, percent = 1, config = btrCfg)
+            assertEquals(1, sinkA.bufferHungerCount)
+            assertEquals(0, sinkB.bufferHungerCount)
+
+            // 2% of 1-hour video on playerB is 72s buffered -> must NOT trigger buffer hunger!
+            PlayerHook.handlePlayerBufferingUpdate(playerB, percent = 2, config = btrCfg)
+            assertEquals(0, sinkB.bufferHungerCount)
+
+            // reset() cleanly unbinds playerA
+            PlayerHook.handlePlayerResetOrRelease(playerA)
+            assertNull(PlayerHook.resolvePlayerSessionId(playerA))
+        } finally {
+            BtrSessionManager.remove(sidA)
+            BtrSessionManager.remove(sidB)
+        }
+    }
+
+    @Test
+    fun testIssue11AkamaiDoesNotLeakUposRedirectWhenBtrSkippedOrEpisodeDisabledOrPreview() {
+        val akamaiEpisode = "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/54/12/500001.m4s?ep_id=12345&hdnts=exp=1899999999~hmac=sig"
+        val akamaiPreview = "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/54/12/500002.m4s?is_preview=1&hdnts=exp=1899999999~hmac=sig"
+        val cfgEpisodeOff = AcceleratorConfig(
+            enabled = true,
+            enableBtr = true,
+            rewriteAkamai = true,
+            enableEpisodeAcceleration = false,
+            targetHost = "upos-sz-mirrorcos.bilivideo.com"
+        )
+
+        val builder1 = FakeBuilder()
+        assertNull(
+            "Episode with enableEpisodeAcceleration=false must NOT hand akamai-redirect UPOS URL to native player",
+            PlayerHook.rewriteArgIfMedia(listOf(akamaiEpisode), builder1, cfgEpisodeOff, onRewrite = null)
+        )
+        assertNull(
+            "Fallback dataSource episode must NOT hand akamai-redirect UPOS URL to native player",
+            PlayerHook.rewriteFallbackDataSource(akamaiEpisode, Any(), configOverride = cfgEpisodeOff, onRewrite = null)
+        )
+
+        val cfgEpisodeOn = cfgEpisodeOff.copy(enableEpisodeAcceleration = true)
+        val builder2 = FakeBuilder()
+        assertNull(
+            "Preview Akamai stream must NOT enter BTR and must NOT hand akamai-redirect UPOS URL to native player",
+            PlayerHook.rewriteArgIfMedia(listOf(akamaiPreview), builder2, cfgEpisodeOn, onRewrite = null)
+        )
+        assertNull(BtrSessionManager.getSessionForBuilder(builder2))
+    }
+
+    @Test
+    fun testIssue14LiveProxyExtensionAndFallbackCleanLiveLookup() {
+        assertEquals("flv", PlayerHook.resolveProxyStreamExtension("https://d1--cn-gotcha01.bilivideo.com/live-bvc/123/live.FLV?next=foo.m3u8"))
+        assertEquals("m3u8", PlayerHook.resolveProxyStreamExtension("https://d1--cn-gotcha01.bilivideo.com/live-bvc/123/index.M3U8?format=flv"))
+        assertEquals("m4s", PlayerHook.resolveProxyStreamExtension("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.m4s?ref=abc.flv"))
+
+        val json = """{"code":0,"data":{"playurl_info":{"playurl":{"stream":[{"protocol_name":"http_stream","format":[{"format_name":"flv","codec":[{"codec_name":"avc","base_url":"/live-bvc/888/live_888.flv?","url_info":[
+            {"host":"https://cn-gotcha01.bilivideo.com","extra":"expires=1&sign=clean"},
+            {"host":"https://1.2.3.4:4483","extra":"expires=1&sign=pcdn"}]}]}]}]}}}}"""
+        PlayinfoRegistry.ingestJson(json)
+
+        val pcdnLive = "http://1.2.3.4:4483/live-bvc/888/live_888.flv?expires=1&sign=pcdn"
+        val cleanLive = "https://cn-gotcha01.bilivideo.com/live-bvc/888/live_888.flv?expires=1&sign=clean"
+        val liveDisabledCfg = AcceleratorConfig(enabled = true, enableBtr = true, enableLiveAcceleration = false, blockPcdn = true)
+        val fallbackRewritten = PlayerHook.rewriteFallbackDataSource(
+            original = pcdnLive,
+            playerInstance = Any(),
+            configOverride = liveDisabledCfg,
+            onRewrite = null
+        )
+        assertEquals(
+            "Fallback dataSource with live BTR disabled must promote clean live URL via findCleanLiveUrlForUrl",
+            cleanLive,
+            fallbackRewritten
+        )
+    }
+
+    @Test
+    fun testIssue16NonEpisodePreviewSkipsBtrAndEmptySetResolveUrlPreservesBtrState() {
+        val btrCfg = AcceleratorConfig(enabled = true, enableBtr = true, enableEpisodeAcceleration = true)
+
+        // 1. Non-episode preview (paid course / charging video with is_preview=1, no ep_id) must skip BTR
+        val nonEpisodePreviewUrl = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/54/12/600001.m4s?is_preview=1&deadline=1899999999"
+        val previewBuilder = FakeBuilder()
+        assertNull(
+            "Non-episode preview URL must skip BTR",
+            PlayerHook.rewriteArgIfMedia(listOf(nonEpisodePreviewUrl), previewBuilder, btrCfg, onRewrite = null)
+        )
+        assertNull(BtrSessionManager.getSessionForBuilder(previewBuilder))
+
+        // 2. setResolveUrl(null / "") after setUrl(validUrl) must NOT clear BTR state or roll back native backups
+        val vodUrl = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/54/12/600002.m4s?deadline=1899999999"
+        val rawBackups = listOf("https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/600002.m4s?deadline=1899999999")
+        val builder = FakeBuilder()
+        val setBackupMethod = FakeBuilder::class.java.getMethod("setBackupUrls", List::class.java)
+
+        val rewritten = PlayerHook.rewriteArgIfMedia(listOf(vodUrl), builder, btrCfg, onRewrite = null, methodName = "setUrl")
+        val btrUrl = rewritten?.get(0) as? String
+        assertTrue(btrUrl?.startsWith("http://127.0.0.1:") == true)
+        val sid = BtrSessionManager.getSessionForBuilder(builder)!!
+
+        try {
+            @Suppress("UNCHECKED_CAST")
+            PlayerHook.interceptSetBackupUrls(
+                builder = builder,
+                method = setBackupMethod,
+                rawArg = rawBackups,
+                config = btrCfg,
+                onRewrite = null,
+                proceedOriginal = { builder.setBackupUrls(rawBackups) },
+                proceedWithArg = { arg -> builder.setBackupUrls(arg as List<String>) }
+            )
+            assertEquals(listOf(btrUrl!!), builder.backups)
+
+            assertNull(PlayerHook.rewriteArgIfMedia(listOf(null), builder, btrCfg, onRewrite = null, methodName = "setResolveUrl"))
+            assertEquals("setResolveUrl(null) must preserve BTR binding", sid, BtrSessionManager.getSessionForBuilder(builder))
+            assertEquals("setResolveUrl(null) must NOT roll back native backups", listOf(btrUrl), builder.backups)
+
+            assertNull(PlayerHook.rewriteArgIfMedia(listOf(""), builder, btrCfg, onRewrite = null, methodName = "setResolveUrl"))
+            assertEquals("setResolveUrl(\"\") must preserve BTR binding", sid, BtrSessionManager.getSessionForBuilder(builder))
+            assertEquals("setResolveUrl(\"\") must NOT roll back native backups", listOf(btrUrl), builder.backups)
+        } finally {
+            BtrSessionManager.remove(sid)
+        }
+    }
+
+    @Test
+    fun testIssue3PlayerHookClosedLoopCallbacksAndActiveHostListenerUpdate() {
+        val autoCfg = AcceleratorConfig(
+            enabled = true,
+            enableBtr = false,
+            selectionMode = "auto",
+            stallRecovery = true,
+            targetHost = "upos-sz-mirrorcos.bilivideo.com"
+        )
+        RemoteClient.setCachedConfigForTesting(autoCfg, System.currentTimeMillis())
+        io.github.jh_mmm.biliaccelerator.core.AutoVodRouter.setSynchronousRaceForTesting(true)
+        io.github.jh_mmm.biliaccelerator.core.AutoVodRouter.setRandomProviderForTesting { 0.99 }
+        io.github.jh_mmm.biliaccelerator.core.AutoVodRouter.setStallGraceMsForTesting(150L)
+
+        val cosov = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/12/34/700001-1-30080.m4s?deadline=1899999999"
+        val ali = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/12/34/700001-1-30080.m4s?deadline=1899999999"
+        val hw = "https://upos-sz-mirrorhw.bilivideo.com/upgcxcode/12/34/700001-1-30080.m4s?deadline=1899999999"
+
+        val builder = FakeBuilder()
+        val setBackupMethod = FakeBuilder::class.java.getMethod("setBackupUrls", List::class.java)
+        @Suppress("UNCHECKED_CAST")
+        PlayerHook.interceptSetBackupUrls(
+            builder = builder,
+            method = setBackupMethod,
+            rawArg = listOf(ali, hw),
+            config = autoCfg,
+            onRewrite = null,
+            proceedOriginal = { builder.setBackupUrls(listOf(ali, hw)) },
+            proceedWithArg = { arg -> builder.setBackupUrls(arg as List<String>) }
+        )
+        assertNull(PlayerHook.rewriteArgIfMedia(listOf(cosov), builder, autoCfg, onRewrite = null))
+
+        val seg = FakeBuiltSegment(cosov)
+        PlayerHook.onSegmentBuilt(builder, seg)
+        val player = FakeIjkPlayer(durationMs = 600_000L, positionMs = 10_000L)
+        PlayerHook.bindPlayerToAsset(player, FakeMediaAsset(listOf(seg)))
+
+        // 1. 703 bandwidth hint updates AutoVodRouter without inflating ends
+        PlayerHook.handlePlayerInfoEvent(player, what = 703, extra = 12_000, config = autoCfg, nowMs = 2000L)
+        val session = io.github.jh_mmm.biliaccelerator.core.AutoVodRouter.getSessionForTesting("700001")!!
+        assertNull("703 bandwidth hint must not inflate session.ends", session.ends["700001-1-30080.m4s"])
+
+        // 2. 701 followed by 702 cancels pending stall timer
+        PlayerHook.handlePlayerInfoEvent(player, what = 701, extra = 0, config = autoCfg, nowMs = 3000L)
+        PlayerHook.handlePlayerInfoEvent(player, what = 702, extra = 0, config = autoCfg, nowMs = 3050L)
+        Thread.sleep(220)
+        assertEquals(0, session.stalls)
+
+        // 3. Repeated player errors trigger error race and ActiveHostListener promotes winner onto builder backups & player tracking
+        io.github.jh_mmm.biliaccelerator.core.AutoVodRouter.configureRangeFetcher { url, _, _, _ ->
+            val host = io.github.jh_mmm.biliaccelerator.core.AutoVodRouter.hostOf(url)
+            val ms = if (host.contains("mirrorhw")) 250L else 1500L
+            io.github.jh_mmm.biliaccelerator.core.AutoVodRouter.RangeFetchResponse(
+                status = 206,
+                bytes = io.github.jh_mmm.biliaccelerator.core.AutoVodRouter.RACE_BYTES,
+                durationMs = ms
+            )
+        }
+        PlayerHook.handlePlayerErrorEvent(player, config = autoCfg, nowMs = 4000L)
+        PlayerHook.handlePlayerErrorEvent(player, config = autoCfg, nowMs = 5000L)
+
+        assertEquals("upos-sz-mirrorhw.bilivideo.com", session.activeHost)
+        assertEquals("ActiveHostListener must update builder backups with winner first", hw, builder.backups.firstOrNull())
+        assertEquals("ActiveHostListener must update tracked player URL", hw, PlayerHook.getTrackedAutoVodUrl(player))
     }
 }

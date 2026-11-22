@@ -4,23 +4,37 @@ import android.net.Uri
 import android.util.Log
 import io.github.jh_mmm.biliaccelerator.btr.BtrSessionManager
 import io.github.jh_mmm.biliaccelerator.core.AcceleratorConfig
+import io.github.jh_mmm.biliaccelerator.core.AutoVodRouter
 import io.github.jh_mmm.biliaccelerator.core.BiliAcceleratorCore
 import io.github.jh_mmm.biliaccelerator.core.PlayinfoRegistry
 import io.github.jh_mmm.biliaccelerator.core.PlayinfoTrackEntry
 import io.github.jh_mmm.biliaccelerator.core.RewriteResult
 import io.github.libxposed.api.XposedModule
+import java.io.FileDescriptor
 import java.lang.ref.ReferenceQueue
 import java.lang.ref.WeakReference
 import java.lang.reflect.Constructor
 import java.lang.reflect.Method
 import java.util.Collections
+import java.util.IdentityHashMap
 import java.util.LinkedHashMap
 import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.max
 
 object PlayerHook {
 
     private const val TAG = "BiliAccelerator-Player"
+
+    private const val MEDIA_PREPARED = 1
+    private const val MEDIA_PLAYBACK_COMPLETE = 2
+    private const val MEDIA_BUFFERING_UPDATE = 3
+    private const val MEDIA_ERROR = 100
+    private const val MEDIA_INFO = 200
+    private const val MEDIA_INFO_VIDEO_RENDERING_START = 3
+    private const val MEDIA_INFO_BUFFERING_START = 701
+    private const val MEDIA_INFO_BUFFERING_END = 702
+    private const val MEDIA_INFO_NETWORK_BANDWIDTH = 703
 
     @Volatile
     var isHooked: Boolean = false
@@ -80,10 +94,32 @@ object PlayerHook {
         }
 
         fun containsKey(key: Any?): Boolean = get(key) != null
+
+        fun entriesSnapshot(): List<Pair<Any, V>> {
+            expungeStale()
+            val out = ArrayList<Pair<Any, V>>()
+            for ((k, v) in map.entries) {
+                val referent = k.get()
+                if (referent != null) {
+                    out.add(referent to v)
+                }
+            }
+            return out
+        }
     }
+
+    private data class AutoVodBinding(
+        val cid: String,
+        val activeUrl: String,
+        val isAudio: Boolean = false,
+        val isDirectDataSource: Boolean = false
+    )
+
+    private val STREAM_SESSION_ID_REGEX = Regex("""/stream/([a-zA-Z0-9_-]+)(?:/|\.[a-zA-Z0-9]+|$)""")
 
     private val builderPendingBackups = IdentityWeakMap<List<String>>()
     private val builderRawBackups = IdentityWeakMap<List<String>>()
+    private val builderPrimaryUrl = IdentityWeakMap<String>()
     private val builderDeferredBackupMethod = IdentityWeakMap<Method>()
     private val builderLastBackupMethod = IdentityWeakMap<Method>()
     private val builderNativeConvergedToBtr = IdentityWeakMap<Boolean>()
@@ -91,9 +127,86 @@ object PlayerHook {
     private val builderCleanLiveUrls = IdentityWeakMap<List<String>>()
     private val builderBtrUrl = IdentityWeakMap<String>()
     private val builderRequestHeaders = IdentityWeakMap<MutableMap<String, String>>()
+    private val builderAutoVod = IdentityWeakMap<AutoVodBinding>()
+    private val builderInflightHandle = IdentityWeakMap<AutoVodRouter.InflightRequestHandle>()
+    private val segmentToSessionId = IdentityWeakMap<String>()
+    private val segmentToBuilder = IdentityWeakMap<Any>()
+    private val segmentToAutoVod = IdentityWeakMap<AutoVodBinding>()
+    private val playerToSessionId = IdentityWeakMap<String>()
+    private val playerToAutoVod = IdentityWeakMap<AutoVodBinding>()
+    private val playerToInflightHandle = IdentityWeakMap<AutoVodRouter.InflightRequestHandle>()
+    private val playerResolvedNonBtr = IdentityWeakMap<Boolean>()
     private val suppressBackupHook = ThreadLocal.withInitial { false }
     private val livePathCleanUrls = object : LinkedHashMap<String, List<String>>(16, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, List<String>>?): Boolean = size > 32
+    }
+
+    private val autoVodHostListener = AutoVodRouter.ActiveHostListener { cid, oldHost, newHost, newUrl, trigger ->
+        onAutoVodActiveHostChanged(cid, oldHost, newHost, newUrl, trigger)
+    }
+
+    internal fun ensureAutoVodListenerRegistered() {
+        AutoVodRouter.addActiveHostListener(autoVodHostListener)
+    }
+
+    /**
+     * 响应 AutoVodRouter 竞速切源事件：
+     * 1. 更新绑定到同一 cid 的 Builder 备用列表（将胜出节点 newUrl 提权置顶并按优先级重排）；
+     * 2. 更新绑定到同一 cid 的 Player 活跃 URL，确保下一次重试/切段/卡顿恢复立即路由至新节点。
+     */
+    internal fun onAutoVodActiveHostChanged(
+        cid: String,
+        oldHost: String,
+        newHost: String,
+        newUrl: String?,
+        trigger: String
+    ) {
+        if (cid.isBlank() || newHost.isBlank()) return
+        val cfg = RemoteClient.getCachedConfig()
+        for ((builder, binding) in builderAutoVod.entriesSnapshot()) {
+            if (binding.cid != cid || binding.isAudio) continue
+            if (!newUrl.isNullOrBlank()) {
+                builderAutoVod[builder] = binding.copy(activeUrl = newUrl)
+                builderPrimaryUrl[builder] = newUrl
+                val currentBackups = builderPendingBackups[builder].orEmpty()
+                val merged = (listOf(newUrl) + currentBackups).distinct()
+                val prioritized = AutoVodRouter.prioritizeBackups(newUrl, merged, cfg)
+                builderPendingBackups[builder] = prioritized
+                applyBuilderBackupUrls(builder, prioritized, builderLastBackupMethod[builder])
+            }
+        }
+        for ((player, binding) in playerToAutoVod.entriesSnapshot()) {
+            if (binding.cid != cid || binding.isAudio) continue
+            if (!newUrl.isNullOrBlank()) {
+                playerToAutoVod[player] = binding.copy(activeUrl = newUrl)
+                val currentBackups = builderPendingBackups[player].orEmpty()
+                if (currentBackups.isNotEmpty()) {
+                    val merged = (listOf(newUrl) + currentBackups).distinct()
+                    builderPendingBackups[player] = AutoVodRouter.prioritizeBackups(newUrl, merged, cfg)
+                }
+            }
+        }
+        Log.i(TAG, "AutoVod active host updated for cid=$cid: $oldHost -> $newHost [trigger=$trigger]")
+    }
+
+    internal fun getTrackedAutoVodUrl(target: Any?): String? {
+        if (target == null) return null
+        return playerToAutoVod[target]?.activeUrl ?: builderAutoVod[target]?.activeUrl
+    }
+
+    fun triggerManualRetest(config: AcceleratorConfig = RemoteClient.fetchConfig()): Boolean {
+        ensureAutoVodListenerRegistered()
+        return AutoVodRouter.triggerManualRetest(config)
+    }
+
+    internal fun resolveProxyStreamExtension(url: String): String {
+        val pathOnly = (BiliAcceleratorCore.parseUri(url)?.path
+            ?: url.substringBefore('?').substringBefore('#')).trim().lowercase()
+        return when {
+            pathOnly.endsWith(".m3u8") -> "m3u8"
+            pathOnly.endsWith(".flv") -> "flv"
+            else -> "m4s"
+        }
     }
 
     internal fun computeNativeBackupsForSession(
@@ -149,10 +262,11 @@ object PlayerHook {
         if (builder == null) return
         builderBtrUrl.remove(builder)
         builderResolvedNonBtr.remove(builder)
+        playerToSessionId.remove(builder)
         BtrSessionManager.unbindBuilderSession(builder)
     }
 
-    internal fun flushDeferredBackups(builder: Any?, btrUrl: String?) {
+    internal fun flushDeferredBackups(builder: Any?, btrUrl: String?, config: AcceleratorConfig? = null) {
         if (builder == null) return
         val deferredMethod = builderDeferredBackupMethod.remove(builder)
         val fallbackMethod = deferredMethod ?: builderLastBackupMethod[builder]
@@ -165,13 +279,73 @@ object PlayerHook {
                 }
             }
         } else if ((deferredMethod != null || wasConvergedToBtr) && pendingBackups != null) {
-            applyBuilderBackupUrls(builder, pendingBackups, fallbackMethod)
+            val effectiveBackups = if (config != null && AutoVodRouter.shouldUseAutoRouting(config)) {
+                val primary = builderPrimaryUrl[builder] ?: pendingBackups.firstOrNull().orEmpty()
+                AutoVodRouter.prioritizeBackups(primary, pendingBackups, config)
+            } else {
+                pendingBackups
+            }
+            applyBuilderBackupUrls(builder, effectiveBackups, fallbackMethod)
         }
     }
 
     internal fun flushDeferredBackupsBeforeBuild(builder: Any?) {
         if (builder != null && builderDeferredBackupMethod.containsKey(builder)) {
             flushDeferredBackups(builder, builderBtrUrl[builder])
+        }
+    }
+
+    internal fun onSegmentBuilt(builder: Any?, builtSegment: Any?) {
+        if (builder == null || builtSegment == null) return
+        segmentToBuilder[builtSegment] = builder
+        val sid = BtrSessionManager.getSessionForBuilder(builder)
+        if (!sid.isNullOrBlank()) {
+            segmentToSessionId[builtSegment] = sid
+        }
+        val autoBinding = builderAutoVod[builder]
+        if (autoBinding != null) {
+            segmentToAutoVod[builtSegment] = autoBinding
+        }
+    }
+
+    private fun trackAutoVodSelection(
+        target: Any?,
+        activeUrl: String,
+        playinfoTrack: PlayinfoTrackEntry?,
+        isDirectDataSource: Boolean
+    ) {
+        ensureAutoVodListenerRegistered()
+        val isAudio = playinfoTrack?.isAudio == true || BiliAcceleratorCore.isAudioTrack(activeUrl)
+        val fileKey = AutoVodRouter.fileKey(activeUrl) ?: playinfoTrack?.fileKey
+        val cid = playinfoTrack?.cid?.takeIf { it > 0L }?.toString()
+            ?: AutoVodRouter.cidOf(fileKey)
+            ?: fileKey
+            ?: return
+        val binding = AutoVodBinding(
+            cid = cid,
+            activeUrl = activeUrl,
+            isAudio = isAudio,
+            isDirectDataSource = isDirectDataSource
+        )
+        val requiredBps = playinfoTrack?.bandwidth?.takeIf { it > 0L }?.toDouble() ?: 0.0
+        val handle = if (!isAudio) {
+            runCatching { AutoVodRouter.beginInflightRequest(url = activeUrl, requiredBps = requiredBps) }.getOrNull()
+        } else {
+            null
+        }
+        if (target != null) {
+            if (isDirectDataSource) {
+                playerToAutoVod[target] = binding
+                playerResolvedNonBtr[target] = true
+                if (handle != null) {
+                    playerToInflightHandle[target] = handle
+                }
+            } else {
+                builderAutoVod[target] = binding
+                if (handle != null) {
+                    builderInflightHandle[target] = handle
+                }
+            }
         }
     }
 
@@ -229,12 +403,20 @@ object PlayerHook {
         }
 
         val distinctRaw = rawList.distinct()
-        val distinctFiltered = if (
-            config.blockPcdn || config.proxyMcdn || config.forceUpos || (config.rewriteAkamai && config.enableBtr)
+        val effectiveConfig = AutoVodRouter.effectiveRewriteConfig(config)
+        val filteredList = if (
+            effectiveConfig.blockPcdn || effectiveConfig.proxyMcdn || effectiveConfig.forceUpos || (effectiveConfig.rewriteAkamai && effectiveConfig.enableBtr)
         ) {
-            filterAndFillBackupUrls(rawList, config, onRewrite)
+            filterAndFillBackupUrls(rawList, effectiveConfig, onRewrite)
         } else {
             distinctRaw
+        }
+        val distinctFiltered = if (AutoVodRouter.shouldUseAutoRouting(config)) {
+            ensureAutoVodListenerRegistered()
+            val primaryForOrder = builder?.let { builderPrimaryUrl[it] } ?: filteredList.firstOrNull().orEmpty()
+            AutoVodRouter.prioritizeBackups(primaryForOrder, filteredList, config)
+        } else {
+            filteredList
         }
 
         builder?.let {
@@ -242,7 +424,7 @@ object PlayerHook {
             builderPendingBackups[it] = distinctFiltered
             builderLastBackupMethod[it] = method
             val cleanLiveList = distinctFiltered.filter { cand ->
-                val host = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(cand)?.host)
+                val host = BiliAcceleratorCore.normalizeHost(BiliAcceleratorCore.parseUri(cand)?.host)
                 BiliAcceleratorCore.isLiveMediaUrl("", cand) &&
                     !BiliAcceleratorCore.isSlowLiveHost(host, cand, config.portHeuristic)
             }
@@ -327,10 +509,10 @@ object PlayerHook {
         val pathCandidates = if (targetPath.isNotBlank()) {
             synchronized(livePathCleanUrls) { livePathCleanUrls[targetPath].orEmpty() }
         } else emptyList()
-        val combined = (builderCandidates + pathCandidates).distinct()
+        val combined = (builderCandidates + pathCandidates + PlayinfoRegistry.lookupLiveBackups(url)).distinct()
         return combined.firstOrNull { cand ->
             val candPath = normalizeLivePathKey(cand)
-            val host = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(cand)?.host)
+            val host = BiliAcceleratorCore.normalizeHost(BiliAcceleratorCore.parseUri(cand)?.host)
             (targetPath.isBlank() || candPath == targetPath) &&
                 !BiliAcceleratorCore.isSlowLiveHost(host, cand, portHeuristic)
         }
@@ -344,6 +526,7 @@ object PlayerHook {
     )
 
     fun init(module: XposedModule, classLoader: ClassLoader) {
+        ensureAutoVodListenerRegistered()
         var hooked = false
         for (className in SEGMENT_BUILDER_CLASSES) {
             val builderClass = try {
@@ -381,7 +564,7 @@ object PlayerHook {
             if (!synchronized(hookedConstructors) { hookedConstructors.add(constructor) }) continue
             try {
                 module.hook(constructor).intercept { chain ->
-                    val newArgs = rewriteArgIfMedia(chain.args, chain.thisObject)
+                    val newArgs = rewriteArgIfMedia(chain.args, chain.thisObject, methodName = "<init>")
                     if (newArgs != null) {
                         chain.proceed(newArgs)
                     } else {
@@ -401,7 +584,7 @@ object PlayerHook {
                 if (!synchronized(hookedMethods) { hookedMethods.add(m) }) continue
                 try {
                     module.hook(m).intercept { chain ->
-                        val newArgs = rewriteArgIfMedia(chain.args, chain.thisObject)
+                        val newArgs = rewriteArgIfMedia(chain.args, chain.thisObject, methodName = m.name)
                         if (newArgs != null) {
                             chain.proceed(newArgs)
                         } else {
@@ -481,14 +664,16 @@ object PlayerHook {
             } catch (_: Throwable) {}
         }
 
-        // 4. 兜底 Hook build()/create()：确保 Builder 仅有 setBackupUrls 而无 setUrl 时也能正确刷出暂缓的备用地址
+        // 4. Hook build()/create()：刷出暂缓备用地址并将 Builder 的 BTR/AutoVod 绑定透传至构建出的 Segment 实例
         val buildMethods = methods.filter { (it.name == "build" || it.name == "create") && it.parameterTypes.isEmpty() }
         for (m in buildMethods) {
             if (!synchronized(hookedMethods) { hookedMethods.add(m) }) continue
             try {
                 module.hook(m).intercept { chain ->
                     flushDeferredBackupsBeforeBuild(chain.thisObject)
-                    chain.proceed()
+                    val built = chain.proceed()
+                    onSegmentBuilt(chain.thisObject, built)
+                    built
                 }
             } catch (_: Throwable) {}
         }
@@ -622,17 +807,16 @@ object PlayerHook {
                 BiliAcceleratorCore.hasDrmSignal(originalUrl) ||
                 (result.changed && BiliAcceleratorCore.hasDrmSignal(result.finalUrl))
 
+        // 所有试看流（含剧集、付费课程/课堂、充电专属等非剧集试看）一律跳过 BTR，交由原生播放器处理
+        if (isPreview) {
+            Log.i(TAG, "Preview stream detected, leaving to native player")
+            return null
+        }
+
         // 剧集专属模式控制：未开启时严格遵循 BTR 原版调度放行至原生播放器
-        if (isEpisode) {
-            if (!config.enableEpisodeAcceleration) {
-                Log.i(TAG, "Episode acceleration disabled in config, leaving to native player")
-                return null
-            }
-            // 剧集试看流（is_preview=1 / Playinfo / Builder 试看属性）：对齐 BTR 原版 unsupportedEpisode，试看流严禁代理介入
-            if (isPreview) {
-                Log.i(TAG, "Episode preview detected, leaving to native player")
-                return null
-            }
+        if (isEpisode && !config.enableEpisodeAcceleration) {
+            Log.i(TAG, "Episode acceleration disabled in config, leaving to native player")
+            return null
         }
 
         // 版权保护/DRM 加密流（Widevine/ChinaDRM/PSSH/is_drm/Playinfo/Builder DRM 属性）绝对不重写至 BTR 本地代理，交由原生直连放行
@@ -673,7 +857,7 @@ object PlayerHook {
         var effectiveResult: RewriteResult
         if (cleanOfficialBackup != null) {
             targetUrl = cleanOfficialBackup
-            val promotedHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(cleanOfficialBackup)?.host)
+            val promotedHost = BiliAcceleratorCore.normalizeHost(BiliAcceleratorCore.parseUri(cleanOfficialBackup)?.host)
             effectiveResult = result.copy(
                 changed = cleanOfficialBackup != originalUrl,
                 finalUrl = cleanOfficialBackup,
@@ -681,8 +865,13 @@ object PlayerHook {
                 reason = "pcdn-promote"
             )
             Log.i(TAG, "Promoted official backup mirror to primary: $cleanOfficialBackup")
+        } else if (!isLive && result.reason == "akamai-redirect" && isAllAkamaiDonorCase(config, originalUrl, rawBackups, if (isPlayinfoUrlsFresh) listOfNotNull(playinfoTrack?.primaryUrl) + playinfoTrack?.backupUrls.orEmpty() else emptyList())) {
+            // 对齐上游 BTR cdn-resolver：仅当所有候选均为 akamaized.net（无非 Akamai 官方 donor）且开启 rewriteAkamai+BTR 时，
+            // Akamai 地址作为 donor 合成 UPOS 镜像；原 Akamai 地址保留为回退，403 节点交由 BanList / 失败追踪淘汰
+            targetUrl = result.finalUrl
+            effectiveResult = result
         } else if (!isLive && result.reason == "akamai-redirect") {
-            // 无干净 UPOS 备用源时，保留原签名 Akamai 地址作为主源，严禁将 Akamai hdnts= 签名发往 UPOS
+            // 存在非 Akamai 官方 donor 或未开启 rewriteAkamai 时，保留原签名 Akamai 地址作为主源 (akamai-pass)
             targetUrl = originalUrl
             effectiveResult = result.copy(
                 changed = false,
@@ -712,13 +901,19 @@ object PlayerHook {
             if (!cleanCandidate.isNullOrBlank() && cleanCandidate != targetUrl && !pendingBackups.contains(cleanCandidate)) {
                 pendingBackups.add(cleanCandidate)
             }
+            // getRoomPlayInfo 登记的官方多线路 (保留各节点 extra 鉴权)，即使 Ijk 仅传入单一主 URL 也可补全备用源
+            for (liveBackup in PlayinfoRegistry.lookupLiveBackups(targetUrl)) {
+                if (liveBackup != targetUrl && !pendingBackups.contains(liveBackup)) {
+                    pendingBackups.add(liveBackup)
+                }
+            }
         }
 
         pendingBackups.removeAll { candidate ->
             if (candidate == targetUrl) {
                 true
             } else {
-                val candHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(candidate)?.host)
+                val candHost = BiliAcceleratorCore.normalizeHost(BiliAcceleratorCore.parseUri(candidate)?.host)
                 !BiliAcceleratorCore.isAkamaiHost(candHost) && candidate.contains("hdnts=", ignoreCase = true)
             }
         }
@@ -728,11 +923,7 @@ object PlayerHook {
         val isAudio = !isLive && (playinfoTrack?.isAudio == true || BiliAcceleratorCore.isAudioTrack(targetUrl))
 
         val proxyPort = io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.port
-        val ext = when {
-            targetUrl.contains(".m3u8") -> "m3u8"
-            targetUrl.contains(".flv") -> "flv"
-            else -> "m4s"
-        }
+        val ext = resolveProxyStreamExtension(targetUrl)
 
         // 若同一 Builder 连续调用构造器 / setUrl / setResolveUrl，优先复用或替换旧 Session，杜绝孤立会话膨胀
         if (builderInstance != null) {
@@ -746,8 +937,10 @@ object PlayerHook {
                 if (!headerRef.isNullOrBlank()) existingSession.referer = headerRef
                 val reusedUrl = "http://127.0.0.1:$proxyPort/stream/${existingSession.sessionId}.$ext"
                 builderResolvedNonBtr.remove(builderInstance)
+                playerResolvedNonBtr.remove(builderInstance)
+                playerToSessionId[builderInstance] = existingSession.sessionId
                 builderBtrUrl[builderInstance] = reusedUrl
-                flushDeferredBackups(builderInstance, reusedUrl)
+                flushDeferredBackups(builderInstance, reusedUrl, config)
                 return BtrRewriteOutcome(reusedUrl, effectiveResult)
             }
             if (existingId != null) {
@@ -774,9 +967,11 @@ object PlayerHook {
         val btrUrl = "http://127.0.0.1:$proxyPort/stream/$sessionId.$ext"
         if (builderInstance != null) {
             builderResolvedNonBtr.remove(builderInstance)
+            playerResolvedNonBtr.remove(builderInstance)
             BtrSessionManager.bindBuilderSession(builderInstance, sessionId)
+            playerToSessionId[builderInstance] = sessionId
             builderBtrUrl[builderInstance] = btrUrl
-            flushDeferredBackups(builderInstance, btrUrl)
+            flushDeferredBackups(builderInstance, btrUrl, config)
         }
         return BtrRewriteOutcome(btrUrl, effectiveResult)
     }
@@ -785,20 +980,30 @@ object PlayerHook {
         args: List<Any?>,
         builderInstance: Any? = null,
         configOverride: AcceleratorConfig? = null,
-        onRewrite: ((RewriteResult) -> Unit)? = { RemoteClient.notifyRewrite(it) }
+        onRewrite: ((RewriteResult) -> Unit)? = { RemoteClient.notifyRewrite(it) },
+        methodName: String? = null
     ): Array<Any?>? {
         val strIndex = args.indexOfFirst { it is String && BiliAcceleratorCore.hasMediaSignal(it) }
         if (strIndex == -1) {
+            // setResolveUrl(null / "") 或无有效 URL 字符串参数时绝不清空已有 BTR 状态或回滚 backupUrls
+            val hasNonBlankStringArg = args.any { it is String && it.isNotBlank() }
+            if (!hasNonBlankStringArg) {
+                return null
+            }
+            if (methodName == "setResolveUrl" && args.none { it is String && it.contains("://") }) {
+                return null
+            }
             clearBuilderBtrState(builderInstance)
             flushDeferredBackups(builderInstance, btrUrl = null)
             return null
         }
 
         val originalUrl = args[strIndex] as String
+        builderInstance?.let { builderPrimaryUrl[it] = originalUrl }
         val config = configOverride ?: RemoteClient.fetchConfig()
         if (!config.enabled) {
             clearBuilderBtrState(builderInstance)
-            flushDeferredBackups(builderInstance, btrUrl = null)
+            flushDeferredBackups(builderInstance, btrUrl = null, config = config)
             builderInstance?.let { builderResolvedNonBtr[it] = true }
             return null
         }
@@ -813,7 +1018,7 @@ object PlayerHook {
             ?: if (result.changed) PlayinfoRegistry.lookup(result.finalUrl) else null
         if (playinfoTrack?.hasDrm == true) {
             clearBuilderBtrState(builderInstance)
-            flushDeferredBackups(builderInstance, btrUrl = null)
+            flushDeferredBackups(builderInstance, btrUrl = null, config = config)
             builderInstance?.let { builderResolvedNonBtr[it] = true }
             Log.i(TAG, "Playinfo DRM detected in media rewrite, leaving stream untouched")
             return null
@@ -834,7 +1039,7 @@ object PlayerHook {
                 }
             }
             clearBuilderBtrState(builderInstance)
-            flushDeferredBackups(builderInstance, btrUrl = null)
+            flushDeferredBackups(builderInstance, btrUrl = null, config = config)
             builderInstance?.let { builderResolvedNonBtr[it] = true }
             if (result.changed) {
                 onRewrite?.invoke(result)
@@ -844,7 +1049,7 @@ object PlayerHook {
             }
             if (result.isPcdn && config.blockPcdn) {
                 val cleanLiveUrl = findCleanLiveUrlForUrl(originalUrl, builderInstance, config.portHeuristic)
-                val cleanLiveHost = cleanLiveUrl?.let { BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(it)?.host) }
+                val cleanLiveHost = cleanLiveUrl?.let { BiliAcceleratorCore.normalizeHost(BiliAcceleratorCore.parseUri(it)?.host) }
                 if (!cleanLiveUrl.isNullOrBlank() && !cleanLiveHost.isNullOrBlank() && cleanLiveUrl != originalUrl) {
                     val liveResult = RewriteResult(
                         changed = true,
@@ -879,38 +1084,85 @@ object PlayerHook {
         }
 
         clearBuilderBtrState(builderInstance)
-        flushDeferredBackups(builderInstance, btrUrl = null)
         builderInstance?.let { builderResolvedNonBtr[it] = true }
         val rawBackups = builderInstance?.let { builderRawBackups[it] }.orEmpty()
-        val cleanOfficialBackup = if (!isLive && (result.changed || result.isPcdn || result.isMcdn || BiliAcceleratorCore.isRelayUrl(originalUrl))) {
-            findPromotableOfficialBackup(originalUrl, result, rawBackups, isLive)
+
+        // 非 BTR 智能模式 (selectionMode == "auto")：由 AutoVodRouter 全权决策，
+        // 若 selectVodUrl 判定保留健康官方/海外节点 (changed = false)，严禁落入原始 config (forceUpos = true) 强行覆盖！
+        if (AutoVodRouter.shouldUseAutoRouting(config)) {
+            val autoRes = AutoVodRouter.selectVodUrl(originalUrl, rawBackups, playinfoTrack, config)
+            val effectiveUrl = if (autoRes.changed && autoRes.finalUrl != originalUrl) autoRes.finalUrl else originalUrl
+            trackAutoVodSelection(builderInstance, effectiveUrl, playinfoTrack, isDirectDataSource = false)
+            flushDeferredBackups(builderInstance, btrUrl = null, config = config)
+            if (autoRes.changed && autoRes.finalUrl != originalUrl) {
+                if (shouldReportResult(autoRes)) onRewrite?.invoke(autoRes)
+                Log.i(TAG, "Auto VOD routing: ${autoRes.originalHost} -> ${autoRes.targetHost} [${autoRes.reason}]")
+                val newArgs = args.toTypedArray()
+                newArgs[strIndex] = autoRes.finalUrl
+                return newArgs
+            }
+            if (shouldReportResult(autoRes)) onRewrite?.invoke(autoRes)
+            return null
+        }
+
+        flushDeferredBackups(builderInstance, btrUrl = null, config = config)
+
+        // 未进入 BTR 时（如剧集加速关闭、试看流、本地代理启动失败）按非 BTR 规则 (enableBtr = false) 回退，
+        // 绝不将 BTR 专属的 akamai-redirect UPOS URL 交给原生播放器导致 HTTP 403。
+        val nonBtrResult = if (config.enableBtr) {
+            BiliAcceleratorCore.rewriteUrl(originalUrl, config.copy(enableBtr = false))
+        } else {
+            result
+        }
+        val cleanOfficialBackup = if (nonBtrResult.changed || nonBtrResult.isPcdn || nonBtrResult.isMcdn || BiliAcceleratorCore.isRelayUrl(originalUrl)) {
+            findPromotableOfficialBackup(originalUrl, nonBtrResult, rawBackups, isLive = false)
         } else {
             null
         }
-        if (result.changed || (cleanOfficialBackup != null && cleanOfficialBackup != originalUrl)) {
-            val finalUrl = cleanOfficialBackup ?: result.finalUrl
-            val finalTargetHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(finalUrl)?.host)
+        if (nonBtrResult.changed || (cleanOfficialBackup != null && cleanOfficialBackup != originalUrl)) {
+            val finalUrl = cleanOfficialBackup ?: nonBtrResult.finalUrl
+            val finalTargetHost = BiliAcceleratorCore.normalizeHost(BiliAcceleratorCore.parseUri(finalUrl)?.host)
             val reportedResult = if (cleanOfficialBackup != null) {
-                result.copy(
+                nonBtrResult.copy(
                     changed = cleanOfficialBackup != originalUrl,
                     finalUrl = finalUrl,
                     targetHost = finalTargetHost,
-                    reason = "pcdn-promote"
+                    reason = "pcdn-promote",
+                    isMcdn = false
                 )
             } else {
-                result
+                nonBtrResult
             }
             if (shouldReportResult(reportedResult)) onRewrite?.invoke(reportedResult)
-            Log.i(TAG, "Rewrote media url: ${result.originalHost} -> $finalTargetHost [${reportedResult.reason}]")
+            Log.i(TAG, "Rewrote media url: ${nonBtrResult.originalHost} -> $finalTargetHost [${reportedResult.reason}]")
             val newArgs = args.toTypedArray()
             newArgs[strIndex] = finalUrl
             return newArgs
         }
-        if (shouldReportResult(result)) onRewrite?.invoke(result)
+        if (shouldReportResult(nonBtrResult)) onRewrite?.invoke(nonBtrResult)
         return null
     }
 
-    private fun findPromotableOfficialBackup(
+    /** All-Akamai donor: rewriteAkamai + BTR 开启，且候选中不存在任何非 Akamai 的干净官方 UPOS donor。 */
+    internal fun isAllAkamaiDonorCase(
+        config: AcceleratorConfig,
+        originalUrl: String,
+        rawBackups: List<String>,
+        playinfoUrls: List<String>
+    ): Boolean {
+        if (!config.rewriteAkamai || !config.enableBtr) return false
+        if (!BiliAcceleratorCore.isAkamaiHost(BiliAcceleratorCore.normalizeHost(BiliAcceleratorCore.parseUri(originalUrl)?.host))) return false
+        if (BiliAcceleratorCore.hasDrmSignal(originalUrl) || BiliAcceleratorCore.isEpisodePreview(originalUrl)) return false
+        // 必须检查未经 filterAndFill 改写的原始候选（并解包 smtcdns / 调度器），避免 Akamai 备选已被改写成 UPOS 后误判存在 donor
+        return (rawBackups + playinfoUrls)
+            .map { u ->
+                val step1 = BiliAcceleratorCore.unwrapSmtcdnsUrl(u).ifBlank { u }
+                BiliAcceleratorCore.extractSchedulerSourceUrl(step1) ?: step1
+            }
+            .none { BiliAcceleratorCore.isCleanUposDonor(it) }
+    }
+
+    internal fun findPromotableOfficialBackup(
         originalUrl: String,
         result: RewriteResult,
         rawBackups: List<String>,
@@ -937,7 +1189,10 @@ object PlayerHook {
             emptyList()
         }
         val candidateBackups = (rawBackups + playinfoUrls)
-            .map { BiliAcceleratorCore.unwrapSmtcdnsUrl(it).ifBlank { it } }
+            .map { u ->
+                val step1 = BiliAcceleratorCore.unwrapSmtcdnsUrl(u).ifBlank { u }
+                BiliAcceleratorCore.extractSchedulerSourceUrl(step1) ?: step1
+            }
             .distinct()
         return candidateBackups.firstOrNull { backup ->
             if (!BiliAcceleratorCore.isCleanUposDonor(backup)) return@firstOrNull false
@@ -962,19 +1217,26 @@ object PlayerHook {
         }
         if (PlayinfoRegistry.lookup(original)?.hasDrm == true) {
             clearBuilderBtrState(playerInstance)
+            playerInstance?.let { playerResolvedNonBtr[it] = true }
             return null
         }
         val config = configOverride ?: RemoteClient.fetchConfig()
         if (!config.enabled) {
             clearBuilderBtrState(playerInstance)
+            playerInstance?.let { playerResolvedNonBtr[it] = true }
             return null
         }
+        val parsed = BiliAcceleratorCore.parseUri(original)
+        val isLive = BiliAcceleratorCore.isLiveMediaUrl(parsed?.path.orEmpty(), original)
         val result = BiliAcceleratorCore.rewriteUrl(original, config)
         if (result.reason == "already-local-proxy") {
             return null
         }
-        if (result.changed && PlayinfoRegistry.lookup(result.finalUrl)?.hasDrm == true) {
+        val playinfoTrack = PlayinfoRegistry.lookup(original)
+            ?: if (result.changed) PlayinfoRegistry.lookup(result.finalUrl) else null
+        if (playinfoTrack?.hasDrm == true) {
             clearBuilderBtrState(playerInstance)
+            playerInstance?.let { playerResolvedNonBtr[it] = true }
             return null
         }
         val btrOutcome = tryRewriteToBtr(original, result, config, playerInstance, headersMap)
@@ -986,32 +1248,465 @@ object PlayerHook {
             return btrOutcome.btrUrl
         }
         clearBuilderBtrState(playerInstance)
-        val isLive = BiliAcceleratorCore.isLiveMediaUrl("", original)
+        playerInstance?.let { playerResolvedNonBtr[it] = true }
+
+        if (isLive) {
+            if (result.changed) {
+                onRewrite?.invoke(result)
+                return result.finalUrl
+            }
+            if (result.isPcdn && config.blockPcdn) {
+                val cleanLiveUrl = findCleanLiveUrlForUrl(original, playerInstance, config.portHeuristic)
+                val cleanLiveHost = cleanLiveUrl?.let { BiliAcceleratorCore.normalizeHost(BiliAcceleratorCore.parseUri(it)?.host) }
+                if (!cleanLiveUrl.isNullOrBlank() && !cleanLiveHost.isNullOrBlank() && cleanLiveUrl != original) {
+                    val liveResult = RewriteResult(
+                        changed = true,
+                        originalUrl = original,
+                        finalUrl = cleanLiveUrl,
+                        originalHost = parsed?.host.orEmpty(),
+                        targetHost = cleanLiveHost,
+                        reason = "live-pcdn-filter",
+                        isPcdn = true,
+                        isMcdn = result.isMcdn,
+                        segmentKey = result.segmentKey
+                    )
+                    onRewrite?.invoke(liveResult)
+                    return cleanLiveUrl
+                }
+            }
+            if (shouldReportResult(result)) onRewrite?.invoke(result)
+            return null
+        }
+
         val rawBackups = playerInstance?.let { builderRawBackups[it] }.orEmpty()
-        val cleanOfficialBackup = if (!isLive && (result.changed || result.isPcdn || result.isMcdn || BiliAcceleratorCore.isRelayUrl(original))) {
-            findPromotableOfficialBackup(original, result, rawBackups, isLive)
+        if (AutoVodRouter.shouldUseAutoRouting(config)) {
+            val autoRes = AutoVodRouter.selectVodUrl(original, rawBackups, playinfoTrack, config)
+            val effectiveUrl = if (autoRes.changed && autoRes.finalUrl != original) autoRes.finalUrl else original
+            trackAutoVodSelection(playerInstance, effectiveUrl, playinfoTrack, isDirectDataSource = true)
+            if (autoRes.changed && autoRes.finalUrl != original) {
+                if (shouldReportResult(autoRes)) onRewrite?.invoke(autoRes)
+                Log.i(TAG, "Auto VOD routing (dataSource): ${autoRes.originalHost} -> ${autoRes.targetHost} [${autoRes.reason}]")
+                return autoRes.finalUrl
+            }
+            if (shouldReportResult(autoRes)) onRewrite?.invoke(autoRes)
+            return null
+        }
+
+        val nonBtrResult = if (config.enableBtr) {
+            BiliAcceleratorCore.rewriteUrl(original, config.copy(enableBtr = false))
+        } else {
+            result
+        }
+        val cleanOfficialBackup = if (nonBtrResult.changed || nonBtrResult.isPcdn || nonBtrResult.isMcdn || BiliAcceleratorCore.isRelayUrl(original)) {
+            findPromotableOfficialBackup(original, nonBtrResult, rawBackups, isLive = false)
         } else {
             null
         }
-        if (result.changed || (cleanOfficialBackup != null && cleanOfficialBackup != original)) {
-            val finalUrl = cleanOfficialBackup ?: result.finalUrl
-            val finalTargetHost = BiliAcceleratorCore.cleanHost(BiliAcceleratorCore.parseUri(finalUrl)?.host)
+        if (nonBtrResult.changed || (cleanOfficialBackup != null && cleanOfficialBackup != original)) {
+            val finalUrl = cleanOfficialBackup ?: nonBtrResult.finalUrl
+            val finalTargetHost = BiliAcceleratorCore.normalizeHost(BiliAcceleratorCore.parseUri(finalUrl)?.host)
             val reportedResult = if (cleanOfficialBackup != null) {
-                result.copy(
+                nonBtrResult.copy(
                     changed = cleanOfficialBackup != original,
                     finalUrl = finalUrl,
                     targetHost = finalTargetHost,
-                    reason = "pcdn-promote"
+                    reason = "pcdn-promote",
+                    isMcdn = false
                 )
             } else {
-                result
+                nonBtrResult
             }
             if (shouldReportResult(reportedResult)) onRewrite?.invoke(reportedResult)
-            Log.i(TAG, "Rewrote IjkMediaPlayer dataSource: ${result.originalHost} -> $finalTargetHost [${reportedResult.reason}]")
+            Log.i(TAG, "Rewrote IjkMediaPlayer dataSource: ${nonBtrResult.originalHost} -> $finalTargetHost [${reportedResult.reason}]")
             return finalUrl
         }
-        if (shouldReportResult(result)) onRewrite?.invoke(result)
+        if (shouldReportResult(nonBtrResult)) onRewrite?.invoke(nonBtrResult)
         return null
+    }
+
+    // ---- IjkMediaPlayer <-> Builder/Segment session binding & callbacks -----
+
+    private data class DiscoveredAssetBinding(
+        var videoSessionId: String? = null,
+        var audioSessionId: String? = null,
+        var videoAutoVod: AutoVodBinding? = null,
+        var videoBuilder: Any? = null
+    )
+
+    private fun extractSessionIdFromProxyUrl(url: String): String? {
+        if (!url.contains("/stream/")) return null
+        if (!url.contains("127.0.0.1") && !url.contains("localhost")) return null
+        return STREAM_SESSION_ID_REGEX.find(url)?.groupValues?.getOrNull(1)?.takeIf { it.isNotBlank() }
+    }
+
+    private fun recordDiscoveredSessionId(sid: String, out: DiscoveredAssetBinding) {
+        val session = BtrSessionManager.get(sid) ?: return
+        if (!session.isAudio) {
+            if (out.videoSessionId == null) out.videoSessionId = sid
+        } else {
+            if (out.audioSessionId == null) out.audioSessionId = sid
+        }
+    }
+
+    private fun scanObjectForBindings(
+        node: Any?,
+        depth: Int,
+        maxDepth: Int,
+        visited: MutableSet<Any>,
+        out: DiscoveredAssetBinding
+    ) {
+        if (node == null || depth > maxDepth) return
+        if (node is Number || node is Boolean || node is Enum<*> || node is Class<*>) return
+        if (node is String) {
+            extractSessionIdFromProxyUrl(node)?.let { recordDiscoveredSessionId(it, out) }
+            return
+        }
+        if (!visited.add(node)) return
+
+        segmentToSessionId[node]?.let { recordDiscoveredSessionId(it, out) }
+        BtrSessionManager.getSessionForBuilder(node)?.let { recordDiscoveredSessionId(it, out) }
+        segmentToAutoVod[node]?.let { b ->
+            if (!b.isAudio && out.videoAutoVod == null) {
+                out.videoAutoVod = b
+                out.videoBuilder = segmentToBuilder[node]
+            }
+        }
+        builderAutoVod[node]?.let { b ->
+            if (!b.isAudio && out.videoAutoVod == null) {
+                out.videoAutoVod = b
+                out.videoBuilder = node
+            }
+        }
+        if (out.videoSessionId != null) return
+
+        when (node) {
+            is Iterable<*> -> {
+                for (item in node) {
+                    scanObjectForBindings(item, depth + 1, maxDepth, visited, out)
+                    if (out.videoSessionId != null) return
+                }
+                return
+            }
+            is Array<*> -> {
+                for (item in node) {
+                    scanObjectForBindings(item, depth + 1, maxDepth, visited, out)
+                    if (out.videoSessionId != null) return
+                }
+                return
+            }
+            is Map<*, *> -> {
+                for (v in node.values) {
+                    scanObjectForBindings(v, depth + 1, maxDepth, visited, out)
+                    if (out.videoSessionId != null) return
+                }
+                return
+            }
+        }
+
+        val clsName = node.javaClass.name
+        if (clsName.startsWith("java.") || clsName.startsWith("android.") || clsName.startsWith("kotlin.")) {
+            return
+        }
+
+        var cls: Class<*>? = node.javaClass
+        var superDepth = 0
+        while (cls != null && cls != Any::class.java && superDepth < 3) {
+            val fields = runCatching { cls.declaredFields }.getOrNull().orEmpty()
+            for (f in fields) {
+                if (java.lang.reflect.Modifier.isStatic(f.modifiers)) continue
+                val fType = f.type
+                if (fType.isPrimitive || Number::class.java.isAssignableFrom(fType) || fType == Boolean::class.javaObjectType) {
+                    continue
+                }
+                val v = runCatching {
+                    f.isAccessible = true
+                    f.get(node)
+                }.getOrNull() ?: continue
+                scanObjectForBindings(v, depth + 1, maxDepth, visited, out)
+                if (out.videoSessionId != null) return
+            }
+            cls = cls.superclass
+            superDepth++
+        }
+    }
+
+    internal fun bindPlayerToAsset(player: Any?, assetOrSegment: Any?) {
+        if (player == null || assetOrSegment == null) return
+        val discovered = DiscoveredAssetBinding()
+        val visited = Collections.newSetFromMap(IdentityHashMap<Any, Boolean>())
+        scanObjectForBindings(assetOrSegment, depth = 0, maxDepth = 4, visited = visited, out = discovered)
+        val bestSid = discovered.videoSessionId ?: discovered.audioSessionId
+        if (!bestSid.isNullOrBlank()) {
+            playerToSessionId[player] = bestSid
+            BtrSessionManager.bindBuilderSession(player, bestSid)
+            playerResolvedNonBtr.remove(player)
+            playerToAutoVod.remove(player)
+            return
+        }
+        val autoBinding = discovered.videoAutoVod
+        if (autoBinding != null) {
+            playerToAutoVod[player] = autoBinding
+            playerResolvedNonBtr[player] = true
+            playerToSessionId.remove(player)
+            BtrSessionManager.unbindBuilderSession(player)
+            discovered.videoBuilder?.let { b ->
+                builderInflightHandle[b]?.let { h ->
+                    playerToInflightHandle[player] = h
+                }
+            }
+        }
+    }
+
+    internal fun resolvePlayerSessionId(player: Any?): String? {
+        if (player == null) return null
+        val direct = playerToSessionId[player] ?: BtrSessionManager.getSessionForBuilder(player)
+        if (!direct.isNullOrBlank()) {
+            if (BtrSessionManager.get(direct) != null) {
+                return direct
+            }
+            playerToSessionId.remove(player)
+            BtrSessionManager.unbindBuilderSession(player)
+        }
+        if (playerResolvedNonBtr[player] == true) {
+            return null
+        }
+        // 兜底：若播放器通过未显式匹配的 setDataSource 重载绑定了 IjkMediaAsset，浅层扫描其持有的资产字段完成绑定
+        val discovered = DiscoveredAssetBinding()
+        val visited = Collections.newSetFromMap(IdentityHashMap<Any, Boolean>())
+        scanObjectForBindings(player, depth = 0, maxDepth = 2, visited = visited, out = discovered)
+        val foundSid = discovered.videoSessionId ?: discovered.audioSessionId
+        if (!foundSid.isNullOrBlank()) {
+            playerToSessionId[player] = foundSid
+            BtrSessionManager.bindBuilderSession(player, foundSid)
+            return foundSid
+        }
+        if (discovered.videoAutoVod != null) {
+            playerToAutoVod[player] = discovered.videoAutoVod!!
+            playerResolvedNonBtr[player] = true
+        }
+        return null
+    }
+
+    private fun invokeZeroArgLongMethod(target: Any, methodName: String): Long? {
+        return runCatching {
+            val m = target.javaClass.getMethod(methodName)
+            (m.invoke(target) as? Number)?.toLong()
+        }.getOrNull()
+    }
+
+    /**
+     * 计算播放器真实的超前缓冲秒数：
+     * 1. 优先读取 IjkMediaPlayer.getVideoCachedDuration()（原生返回超前缓冲毫秒数）；
+     * 2. 次优使用 MEDIA_BUFFERING_UPDATE 百分比 * getDuration() - getCurrentPosition() 计算真实剩余缓冲；
+     * 3. 若均不可用返回 null，绝不把 0..100% 总时长百分比当作 0..15s 缓冲池。
+     */
+    internal fun resolvePlayerBufferAheadSeconds(player: Any?, percent: Int? = null): Double? {
+        if (player == null) return null
+        val cachedMs = invokeZeroArgLongMethod(player, "getVideoCachedDuration")
+        if (cachedMs != null && cachedMs >= 0L) {
+            return cachedMs.toDouble() / 1000.0
+        }
+        if (percent != null) {
+            val durationMs = invokeZeroArgLongMethod(player, "getDuration") ?: -1L
+            val positionMs = invokeZeroArgLongMethod(player, "getCurrentPosition") ?: -1L
+            if (durationMs > 0L && positionMs >= 0L) {
+                val bufferedPosMs = durationMs.toDouble() * percent.coerceIn(0, 100) / 100.0
+                return max(0.0, (bufferedPosMs - positionMs.toDouble()) / 1000.0)
+            }
+        }
+        return null
+    }
+
+    internal fun handlePlayerInfoEvent(
+        player: Any?,
+        what: Int,
+        extra: Int,
+        config: AcceleratorConfig = RemoteClient.getCachedConfig(),
+        nowMs: Long = System.currentTimeMillis()
+    ) {
+        val sid = resolvePlayerSessionId(player)
+        val activeUrl = player?.let { playerToAutoVod[it]?.activeUrl }
+        when (what) {
+            MEDIA_INFO_BUFFERING_START -> {
+                if (sid != null) {
+                    BtrSessionManager.notifyPlayerStall(sid, nowMs)
+                }
+                val bufS = resolvePlayerBufferAheadSeconds(player) ?: 0.0
+                runCatching {
+                    AutoVodRouter.reportPlayerStall(
+                        urlOrHost = activeUrl,
+                        bufferAheadS = bufS,
+                        config = config,
+                        nowMs = nowMs
+                    )
+                }
+            }
+            MEDIA_INFO_BUFFERING_END, MEDIA_INFO_VIDEO_RENDERING_START -> {
+                runCatching {
+                    AutoVodRouter.reportPlayerBufferingEnd(urlOrHost = activeUrl, nowMs = nowMs)
+                }
+                if (what == MEDIA_INFO_BUFFERING_END) {
+                    val openHandle = player?.let { playerToInflightHandle.remove(it) }
+                    if (openHandle != null && !openHandle.ended) {
+                        val bufS = resolvePlayerBufferAheadSeconds(player) ?: 10.0
+                        runCatching {
+                            AutoVodRouter.endInflightRequest(
+                                handle = openHandle,
+                                httpStatus = 200,
+                                loadedBytes = max(openHandle.loadedBytes, 1L),
+                                aborted = false,
+                                bufferAheadS = bufS,
+                                config = config,
+                                nowMs = nowMs
+                            )
+                        }
+                    }
+                }
+            }
+            MEDIA_INFO_NETWORK_BANDWIDTH -> {
+                if (extra > 0) {
+                    val bufS = resolvePlayerBufferAheadSeconds(player) ?: 10.0
+                    val openHandle = player?.let { playerToInflightHandle[it] }
+                    if (openHandle != null && !openHandle.ended) {
+                        val deltaBytes = (extra.toLong() * 1000L) / 8L
+                        runCatching {
+                            AutoVodRouter.reportInflightProgress(
+                                handle = openHandle,
+                                loadedBytes = openHandle.loadedBytes + deltaBytes,
+                                bufferAheadS = bufS,
+                                config = config,
+                                nowMs = nowMs
+                            )
+                        }
+                    }
+                    runCatching {
+                        AutoVodRouter.reportBandwidthHint(
+                            kbps = extra,
+                            urlOrHost = activeUrl,
+                            config = config,
+                            nowMs = nowMs
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    internal fun handlePlayerBufferingUpdate(
+        player: Any?,
+        percent: Int,
+        config: AcceleratorConfig = RemoteClient.getCachedConfig(),
+        nowMs: Long = System.currentTimeMillis()
+    ) {
+        val bufferAheadS = resolvePlayerBufferAheadSeconds(player, percent) ?: return
+        val sid = resolvePlayerSessionId(player)
+        if (sid != null && bufferAheadS < AutoVodRouter.STUCK_URGENT_BUFFER_S) {
+            BtrSessionManager.notifyPlayerBufferHunger(sid, nowMs = nowMs)
+        }
+        val activeUrl = player?.let { playerToAutoVod[it]?.activeUrl }
+        if (AutoVodRouter.shouldUseAutoRouting(config)) {
+            val openHandle = player?.let { playerToInflightHandle[it] }
+            if (openHandle != null && !openHandle.ended) {
+                val tcpBytesPerSec = player?.let { invokeZeroArgLongMethod(it, "getTcpSpeed") } ?: 0L
+                if (tcpBytesPerSec > 0L) {
+                    runCatching {
+                        AutoVodRouter.reportInflightProgress(
+                            handle = openHandle,
+                            loadedBytes = openHandle.loadedBytes + tcpBytesPerSec,
+                            bufferAheadS = bufferAheadS,
+                            config = config,
+                            nowMs = nowMs
+                        )
+                    }
+                }
+            }
+            runCatching {
+                AutoVodRouter.reportPlayerBufferAhead(
+                    bufferAheadS = bufferAheadS,
+                    urlOrHost = activeUrl,
+                    config = config,
+                    nowMs = nowMs
+                )
+            }
+        }
+    }
+
+    internal fun handlePlayerErrorEvent(
+        player: Any?,
+        config: AcceleratorConfig = RemoteClient.getCachedConfig(),
+        nowMs: Long = System.currentTimeMillis()
+    ) {
+        val activeUrl = player?.let { playerToAutoVod[it]?.activeUrl }
+        runCatching { AutoVodRouter.reportPlayerBufferingEnd(urlOrHost = activeUrl, nowMs = nowMs) }
+        val openHandle = player?.let { playerToInflightHandle.remove(it) }
+        if (openHandle != null && !openHandle.ended) {
+            runCatching {
+                AutoVodRouter.endInflightRequest(
+                    handle = openHandle,
+                    httpStatus = 0,
+                    loadedBytes = 0L,
+                    aborted = false,
+                    bufferAheadS = 0.0,
+                    config = config,
+                    nowMs = nowMs
+                )
+            }
+        } else {
+            runCatching {
+                AutoVodRouter.reportTransferError(
+                    urlOrHost = activeUrl,
+                    config = config,
+                    nowMs = nowMs
+                )
+            }
+        }
+    }
+
+    internal fun handlePlayerLifecycleEvent(
+        player: Any?,
+        eventWhat: Int,
+        config: AcceleratorConfig = RemoteClient.getCachedConfig(),
+        nowMs: Long = System.currentTimeMillis()
+    ) {
+        if (eventWhat != MEDIA_PREPARED && eventWhat != MEDIA_PLAYBACK_COMPLETE) return
+        val activeUrl = player?.let { playerToAutoVod[it]?.activeUrl }
+        runCatching { AutoVodRouter.reportPlayerBufferingEnd(urlOrHost = activeUrl, nowMs = nowMs) }
+        val openHandle = player?.let { playerToInflightHandle.remove(it) }
+        if (openHandle != null && !openHandle.ended) {
+            val bufS = resolvePlayerBufferAheadSeconds(player) ?: 10.0
+            runCatching {
+                AutoVodRouter.endInflightRequest(
+                    handle = openHandle,
+                    httpStatus = 200,
+                    loadedBytes = max(openHandle.loadedBytes, 1L),
+                    aborted = false,
+                    bufferAheadS = bufS,
+                    config = config,
+                    nowMs = nowMs
+                )
+            }
+        }
+    }
+
+    internal fun handlePlayerResetOrRelease(player: Any?) {
+        if (player == null) return
+        val activeUrl = playerToAutoVod[player]?.activeUrl
+        runCatching { AutoVodRouter.reportPlayerBufferingEnd(urlOrHost = activeUrl) }
+        val openHandle = playerToInflightHandle.remove(player)
+        if (openHandle != null && !openHandle.ended) {
+            runCatching {
+                AutoVodRouter.endInflightRequest(
+                    handle = openHandle,
+                    httpStatus = 0,
+                    loadedBytes = openHandle.loadedBytes,
+                    aborted = true
+                )
+            }
+        }
+        playerToSessionId.remove(player)
+        playerToAutoVod.remove(player)
+        playerResolvedNonBtr.remove(player)
+        BtrSessionManager.unbindBuilderSession(player)
     }
 
     private fun hookFallbackPlayer(module: XposedModule, classLoader: ClassLoader): Boolean {
@@ -1028,8 +1723,10 @@ object PlayerHook {
         var fallbackHooked = false
 
         try {
+            val allMethods = (ijkPlayerClass.declaredMethods + ijkPlayerClass.methods).distinct()
+
             // 1. Hook setDataSource(String path) 及 setDataSource(String path, Map<String, String> headers) 等所有首参为 String 的重载
-            val stringMethods = (ijkPlayerClass.declaredMethods + ijkPlayerClass.methods).distinct().filter {
+            val stringMethods = allMethods.filter {
                 it.name == "setDataSource" && it.parameterTypes.isNotEmpty() && it.parameterTypes[0] == String::class.java
             }
             for (m in stringMethods) {
@@ -1050,7 +1747,7 @@ object PlayerHook {
             }
 
             // 2. Hook setDataSource(Context context, Uri uri) 及 setDataSource(Context, Uri, Map) 等重载
-            val uriMethods = (ijkPlayerClass.declaredMethods + ijkPlayerClass.methods).distinct().filter {
+            val uriMethods = allMethods.filter {
                 it.name == "setDataSource" && it.parameterTypes.size >= 2 && it.parameterTypes[1] == Uri::class.java
             }
             for (m in uriMethods) {
@@ -1070,8 +1767,46 @@ object PlayerHook {
                 } catch (_: Throwable) {}
             }
 
-            // 3. Hook IjkMediaPlayer / AbstractMediaPlayer buffering & stall callbacks 通知并发控制器
-            //    优先拦截 postEventFromNative；仅当未挂载 postEventFromNative 时才回退到 notifyOnInfo/notifyOnBufferingUpdate，避免重复触发
+            // 2.5 Hook IjkMediaPlayer 接收 IjkMediaAsset / IMediaDataSource 等对象的重载，建立 IjkMediaPlayer -> BTR Session / AutoVod 绑定
+            val assetSetterMethods = allMethods.filter { m ->
+                (m.name == "setDataSource" || m.name == "setMediaAsset" || m.name == "setAsset") &&
+                    m.parameterTypes.isNotEmpty() &&
+                    m.parameterTypes[0] != String::class.java &&
+                    m.parameterTypes[0] != FileDescriptor::class.java &&
+                    !(m.parameterTypes.size >= 2 && m.parameterTypes[1] == Uri::class.java)
+            }
+            for (m in assetSetterMethods) {
+                if (!synchronized(hookedMethods) { hookedMethods.add(m) }) continue
+                try {
+                    module.hook(m).intercept { chain ->
+                        val player = chain.thisObject
+                        for (arg in chain.args) {
+                            if (arg != null && arg !is Number && arg !is Boolean && arg !is String) {
+                                runCatching { bindPlayerToAsset(player, arg) }
+                            }
+                        }
+                        chain.proceed()
+                    }
+                    fallbackHooked = true
+                } catch (_: Throwable) {}
+            }
+
+            // 2.6 Hook reset/release/stop：释放播放器绑定并中止在途统计与卡顿计时器
+            val resetMethods = allMethods.filter {
+                (it.name == "reset" || it.name == "release" || it.name == "stop") && it.parameterTypes.isEmpty()
+            }
+            for (m in resetMethods) {
+                if (!synchronized(hookedMethods) { hookedMethods.add(m) }) continue
+                try {
+                    module.hook(m).intercept { chain ->
+                        runCatching { handlePlayerResetOrRelease(chain.thisObject) }
+                        chain.proceed()
+                    }
+                } catch (_: Throwable) {}
+            }
+
+            // 3. Hook IjkMediaPlayer / AbstractMediaPlayer buffering, stall, bandwidth & error callbacks
+            //    优先拦截 postEventFromNative；仅当未挂载 postEventFromNative 时才回退到 notifyOn*，避免重复触发
             val eventClasses = listOfNotNull(ijkPlayerClass, ijkPlayerClass.superclass)
             var hookedPostEvent = false
             for (cls in eventClasses) {
@@ -1084,13 +1819,23 @@ object PlayerHook {
                         try {
                             module.hook(m).intercept { chain ->
                                 val weakPlayer = (chain.args.getOrNull(0) as? WeakReference<*>)?.get()
-                                val sid = weakPlayer?.let { BtrSessionManager.getSessionForBuilder(it) }
                                 val what = chain.args.getOrNull(1) as? Int
                                 val arg1 = chain.args.getOrNull(2) as? Int
-                                if (what == 200 && arg1 == 701) {
-                                    BtrSessionManager.notifyPlayerStall(sid)
-                                } else if (what == 3 && arg1 != null && arg1 in 0..15) {
-                                    BtrSessionManager.notifyPlayerBufferHunger(sid)
+                                val arg2 = chain.args.getOrNull(3) as? Int
+                                val cfg = RemoteClient.getCachedConfig()
+                                when (what) {
+                                    MEDIA_INFO -> if (arg1 != null) {
+                                        handlePlayerInfoEvent(weakPlayer, arg1, arg2 ?: 0, cfg)
+                                    }
+                                    MEDIA_BUFFERING_UPDATE -> if (arg1 != null) {
+                                        handlePlayerBufferingUpdate(weakPlayer, arg1, cfg)
+                                    }
+                                    MEDIA_ERROR -> {
+                                        handlePlayerErrorEvent(weakPlayer, cfg)
+                                    }
+                                    MEDIA_PREPARED, MEDIA_PLAYBACK_COMPLETE -> {
+                                        handlePlayerLifecycleEvent(weakPlayer, what, cfg)
+                                    }
                                 }
                                 chain.proceed()
                             }
@@ -1107,9 +1852,9 @@ object PlayerHook {
                                 "notifyOnInfo" -> if (m.parameterTypes.size == 2 && synchronized(hookedMethods) { hookedMethods.add(m) }) {
                                     module.hook(m).intercept { chain ->
                                         val what = chain.args.getOrNull(0) as? Int
-                                        if (what == 701) {
-                                            val sid = chain.thisObject?.let { BtrSessionManager.getSessionForBuilder(it) }
-                                            BtrSessionManager.notifyPlayerStall(sid)
+                                        val extra = chain.args.getOrNull(1) as? Int ?: 0
+                                        if (what != null) {
+                                            handlePlayerInfoEvent(chain.thisObject, what, extra, RemoteClient.getCachedConfig())
                                         }
                                         chain.proceed()
                                     }
@@ -1117,10 +1862,27 @@ object PlayerHook {
                                 "notifyOnBufferingUpdate" -> if (m.parameterTypes.size == 1 && synchronized(hookedMethods) { hookedMethods.add(m) }) {
                                     module.hook(m).intercept { chain ->
                                         val pct = chain.args.getOrNull(0) as? Int
-                                        if (pct != null && pct in 0..15) {
-                                            val sid = chain.thisObject?.let { BtrSessionManager.getSessionForBuilder(it) }
-                                            BtrSessionManager.notifyPlayerBufferHunger(sid)
+                                        if (pct != null) {
+                                            handlePlayerBufferingUpdate(chain.thisObject, pct, RemoteClient.getCachedConfig())
                                         }
+                                        chain.proceed()
+                                    }
+                                }
+                                "notifyOnError" -> if (m.parameterTypes.size == 2 && synchronized(hookedMethods) { hookedMethods.add(m) }) {
+                                    module.hook(m).intercept { chain ->
+                                        handlePlayerErrorEvent(chain.thisObject, RemoteClient.getCachedConfig())
+                                        chain.proceed()
+                                    }
+                                }
+                                "notifyOnPrepared" -> if (m.parameterTypes.isEmpty() && synchronized(hookedMethods) { hookedMethods.add(m) }) {
+                                    module.hook(m).intercept { chain ->
+                                        handlePlayerLifecycleEvent(chain.thisObject, MEDIA_PREPARED, RemoteClient.getCachedConfig())
+                                        chain.proceed()
+                                    }
+                                }
+                                "notifyOnCompletion" -> if (m.parameterTypes.isEmpty() && synchronized(hookedMethods) { hookedMethods.add(m) }) {
+                                    module.hook(m).intercept { chain ->
+                                        handlePlayerLifecycleEvent(chain.thisObject, MEDIA_PLAYBACK_COMPLETE, RemoteClient.getCachedConfig())
                                         chain.proceed()
                                     }
                                 }

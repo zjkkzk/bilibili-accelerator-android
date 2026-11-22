@@ -666,4 +666,167 @@ class MossGrpcHookTest {
         val asyncCb = MossGrpcHook.resolveGrpcRefreshCallbackFromArgs(blockingMethod, listOf(fakeClientCallAsync, Any(), Any()))
         assertNotNull("3-arg asyncUnaryCall must resolve refreshCallback via ClientCall meta", asyncCb)
     }
+
+    @Test
+    fun testStaleSignedHttpRequestReplayIsRejectedAndAuthFailureInvalidatesRefresher() {
+        RemoteClient.setCachedConfigForTesting(AcceleratorConfig(enabled = true))
+        val baseSec = 1_700_000_000L
+        var fakeNowMs = baseSec * 1000L
+        MossGrpcHook.clockMs = { fakeNowMs }
+
+        val wbiUrl = "https://api.bilibili.com/x/player/wbi/playurl?cid=111111&wts=$baseSec&w_rid=deadbeef"
+        val appSignedUrl = "https://api.bilibili.com/x/player/playurl?cid=222222&ts=$baseSec&sign=cafebabe"
+        assertTrue(MossGrpcHook.isCapturedHttpRequestFreshForReplay(wbiUrl, fakeNowMs, fakeNowMs + 60_000L))
+        assertFalse(
+            "WBI request with wts older than 10 min must be rejected as stale",
+            MossGrpcHook.isCapturedHttpRequestFreshForReplay(wbiUrl, fakeNowMs, fakeNowMs + 2 * 3600_000L)
+        )
+        assertFalse(
+            "App-signed request with ts older than 10 min must be rejected as stale",
+            MossGrpcHook.isCapturedHttpRequestFreshForReplay(appSignedUrl, fakeNowMs, fakeNowMs + 30 * 60_000L)
+        )
+
+        val initialUrl = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/11/11/111111/111111-1-30080.m4s?deadline=1800000000"
+        val freshUrl = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/11/11/111111/111111-1-30080.m4s?deadline=1950000000"
+        val initialJson = """{"code":0,"data":{"cid":111111,"dash":{"video":[{"id":80,"baseUrl":"$initialUrl"}]}}}"""
+        val freshJson = """{"code":0,"data":{"cid":111111,"dash":{"video":[{"id":80,"baseUrl":"$freshUrl"}]}}}"""
+
+        val client = FakeOkHttpClient(freshJson)
+        val req = FakeOkHttpRequest("GET", wbiUrl)
+        assertTrue(MossGrpcHook.captureHttpPlayurlCallIfEnabled(client, req, nowMs = fakeNowMs))
+        assertTrue(MossGrpcHook.inspectHttpPlayinfoJsonIfEnabled(initialJson, allowRefreshCallback = true, nowMs = fakeNowMs + 100L))
+        val cb = PlayinfoRegistry.findRefreshCallback(initialUrl)!!
+
+        // Within valid window -> replay succeeds
+        fakeNowMs = (baseSec + 120L) * 1000L
+        assertTrue(cb.refresh())
+        assertEquals(1, client.callCount)
+
+        // 2 hours later -> wts is stale, MUST abort without invoking client.newCall
+        fakeNowMs = (baseSec + 7200L) * 1000L
+        assertFalse("Stale signed HTTP request must not be replayed", cb.refresh())
+        assertEquals("No network call may be issued for stale signed request", 1, client.callCount)
+
+        // HTTP 412 / JSON -3 invalidates refresher permanently so it stops spamming replays
+        PlayinfoRegistry.resetForTesting()
+        MossGrpcHook.resetPlayinfoCaptureForTesting()
+        val hitCounter = AtomicInteger(0)
+        val client412 = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                hitCounter.incrementAndGet()
+                Response.Builder()
+                    .request(chain.request())
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(412)
+                    .message("Precondition Failed")
+                    .body("""{"code":-412,"message":"risk"}""".toResponseBody("application/json".toMediaType()))
+                    .build()
+            }
+            .build()
+        val req412 = Request.Builder().url("https://api.bilibili.com/x/player/wbi/playurl?cid=333333").get().build()
+        val url412 = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/33/33/333333/333333-1-30080.m4s?deadline=1800000000"
+        val json412 = """{"code":0,"data":{"cid":333333,"dash":{"video":[{"id":80,"baseUrl":"$url412"}]}}}"""
+        assertTrue(MossGrpcHook.captureHttpPlayurlCallIfEnabled(client412, req412, nowMs = 100_000L))
+        assertTrue(MossGrpcHook.inspectHttpPlayinfoJsonIfEnabled(json412, allowRefreshCallback = true, nowMs = 100_100L))
+        val cb412 = PlayinfoRegistry.findRefreshCallback(url412)!!
+        assertFalse(cb412.refresh())
+        assertEquals(1, hitCounter.get())
+        assertFalse("Invalidated refresher after 412 must abort without another HTTP request", cb412.refresh())
+        assertEquals("Must not spam 412 replays after invalidation", 1, hitCounter.get())
+    }
+
+    @Test
+    fun testConsumeMatchingHttpCallerNeverBindsWrongVideoUnderConcurrency() {
+        RemoteClient.setCachedConfigForTesting(AcceleratorConfig(enabled = true))
+        val t0 = 600_000L
+
+        val urlA = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/11/11/111111/111111-1-30080.m4s?deadline=1800000000"
+        val urlB = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/22/22/222222/222222-1-30080.m4s?deadline=1800000000"
+        val urlC = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/33/33/333333/333333-1-30080.m4s?deadline=1800000000"
+        val urlAmbig = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/99/99/ambiguous-no-cid.m4s?deadline=1800000000"
+
+        val freshA = """{"code":0,"data":{"cid":111111,"dash":{"video":[{"id":80,"baseUrl":"https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/11/11/111111/111111-1-30080.m4s?deadline=1999000001"}]}}}"""
+        val freshB = """{"code":0,"data":{"cid":222222,"dash":{"video":[{"id":80,"baseUrl":"https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/22/22/222222/222222-1-30080.m4s?deadline=1999000002"}]}}}"""
+        val clientA = FakeOkHttpClient(freshA)
+        val clientB = FakeOkHttpClient(freshB)
+        val reqA = FakeOkHttpRequest("GET", "https://api.bilibili.com/x/player/wbi/playurl?cid=111111")
+        val reqB = FakeOkHttpRequest("GET", "https://api.bilibili.com/pgc/player/web/playurl?cid=222222&ep_id=888")
+
+        assertTrue(MossGrpcHook.captureHttpPlayurlCallIfEnabled(clientA, reqA, nowMs = t0))
+        assertTrue(MossGrpcHook.captureHttpPlayurlCallIfEnabled(clientB, reqB, nowMs = t0 + 10L))
+
+        // 1. Ambiguous JSON without IDs while 2 concurrent calls are in flight must NOT blindly pop reqB
+        val jsonAmbig = """{"code":0,"data":{"dash":{"video":[{"id":80,"baseUrl":"$urlAmbig"}]}}}"""
+        assertTrue(MossGrpcHook.inspectHttpPlayinfoJsonIfEnabled(jsonAmbig, allowRefreshCallback = true, nowMs = t0 + 20L))
+        assertNull("Ambiguous concurrent JSON must not steal another video's refresher", PlayinfoRegistry.findRefreshCallback(urlAmbig))
+        assertFalse("Ambiguous UGC JSON must not inherit PGC flag from reqB", PlayinfoRegistry.lookup(urlAmbig)!!.isEpisode)
+
+        // 2. Unrelated Video C (cid=333333) must NOT match reqA or reqB
+        val jsonC = """{"code":0,"data":{"cid":333333,"dash":{"video":[{"id":80,"baseUrl":"$urlC"}]}}}"""
+        assertTrue(MossGrpcHook.inspectHttpPlayinfoJsonIfEnabled(jsonC, allowRefreshCallback = true, nowMs = t0 + 30L))
+        assertNull("Mismatched cid must not bind reqA or reqB", PlayinfoRegistry.findRefreshCallback(urlC))
+
+        // 3. Video A JSON matches reqA by cid even without bodyObj binding, leaving reqB intact for Video B!
+        val jsonA = """{"code":0,"data":{"dash":{"video":[{"id":80,"baseUrl":"$urlA"}]}}}"""
+        assertTrue(MossGrpcHook.inspectHttpPlayinfoJsonIfEnabled(jsonA, allowRefreshCallback = true, nowMs = t0 + 40L))
+        assertFalse("Video A matched reqA (UGC), not reqB (PGC)", PlayinfoRegistry.lookup(urlA)!!.isEpisode)
+        val cbA = PlayinfoRegistry.findRefreshCallback(urlA)
+        assertNotNull("Video A must match reqA via cid extracted from upgcxcode URL", cbA)
+        assertTrue(cbA!!.refresh())
+        assertEquals(1, clientA.callCount)
+        assertEquals(0, clientB.callCount)
+
+        // 4. Unbound ResponseBody for an unknown video must NOT hijack remaining reqB
+        val unboundBody = FakeResponseBody(jsonAmbig)
+        assertTrue(MossGrpcHook.inspectHttpPlayinfoJsonIfEnabled(jsonAmbig, allowRefreshCallback = true, nowMs = t0 + 50L, bodyObj = unboundBody))
+        assertNull("Unbound ResponseBody must not steal unrelated reqB", PlayinfoRegistry.findRefreshCallback(urlAmbig))
+
+        // 5. Video B still matches reqB cleanly
+        val jsonB = """{"code":0,"data":{"cid":222222,"dash":{"video":[{"id":80,"baseUrl":"$urlB"}]}}}"""
+        assertTrue(MossGrpcHook.inspectHttpPlayinfoJsonIfEnabled(jsonB, allowRefreshCallback = true, nowMs = t0 + 60L))
+        assertTrue("Video B must retain PGC flag from reqB", PlayinfoRegistry.lookup(urlB)!!.isEpisode)
+        assertTrue(PlayinfoRegistry.findRefreshCallback(urlB)!!.refresh())
+        assertEquals(1, clientB.callCount)
+    }
+
+    @Test
+    fun testFastLooksLikePlayinfoJsonSniffsExpandedPcdnAndMcdnKeywords() {
+        val keywords = listOf("mountaintoys", "szbdyd", "nexusedgeio", "ahdohpiechei", "mcdn")
+        for (kw in keywords) {
+            val payload = """{"code":0,"data":{"dash":{"video":[{"id":80,"bandwidth":4500000,"baseUrl":"https://node.$kw.example/media/123456.m4s?deadline=1900000000"}]}}}"""
+            assertTrue("fastLooksLikePlayinfoJson must detect keyword '$kw'", MossGrpcHook.fastLooksLikePlayinfoJson(payload))
+        }
+    }
+}
+
+
+class MossGrpcHookLiveTest {
+
+    @After
+    fun tearDown() {
+        PlayinfoRegistry.resetForTesting()
+    }
+
+    private val liveJson = """{"code":0,"message":"0","data":{"room_id":1,"playurl_info":{"playurl":{"stream":[{"protocol_name":"http_hls","format":[{"format_name":"fmp4","codec":[{"codec_name":"avc","base_url":"/live-bvc/9/index.m3u8?","url_info":[{"host":"https://d1--cn-gotcha208.bilivideo.com","extra":"expires=9&sign=x"},{"host":"https://d1--cn-gotcha204.bilivideo.com","extra":"expires=9&sign=y"}]}]}]}]}}}}"""
+
+    @Test
+    fun testGetRoomPlayInfoUrlIsRecognizedAndJsonLooksLikePlayinfo() {
+        assertTrue(MossGrpcHook.isPlayurlApiUrl("https://api.live.bilibili.com/xlive/app-room/v2/index/getRoomPlayInfo?room_id=1"))
+        assertTrue(MossGrpcHook.fastLooksLikePlayinfoJson(liveJson))
+        assertTrue(PlayinfoRegistry.looksLikePlayinfoJson(liveJson))
+    }
+
+    @Test
+    fun testLiveJsonIngestStoresAllOfficialLinesWithExtra() {
+        PlayinfoRegistry.ingestJson(liveJson)
+        val first = "https://d1--cn-gotcha208.bilivideo.com/live-bvc/9/index.m3u8?expires=9&sign=x"
+        val backups = PlayinfoRegistry.lookupLiveBackups(first)
+        assertEquals(listOf("https://d1--cn-gotcha204.bilivideo.com/live-bvc/9/index.m3u8?expires=9&sign=y"), backups)
+    }
+
+    @Test
+    fun testRoomPlayInfoMethodAndObjectRecognized() {
+        class FakeRoomPlayInfoReply
+        assertTrue(MossGrpcHook.looksLikePlayViewObject(FakeRoomPlayInfoReply()))
+    }
 }
