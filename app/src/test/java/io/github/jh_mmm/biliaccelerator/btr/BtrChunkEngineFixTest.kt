@@ -1201,6 +1201,8 @@ class BtrChunkEngineFixTest {
         val expiringUrl = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/15/1/cross_proc.m4s?deadline=${nowSec + 30}"
         val freshUrl = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/15/1/cross_proc.m4s?deadline=${nowSec + 3600}&fresh=1"
         val invoked = AtomicInteger(0)
+        // 注册临近过期会话前先暂停默认刷新器，避免后台定时任务抢先执行失败并写入冷却窗口导致偶发竞态
+        BtrSessionManager.defaultRefreshProvider = null
         val sid = BtrSessionManager.register(expiringUrl)
         try {
             val session = BtrSessionManager.get(sid)!!
