@@ -120,11 +120,28 @@ class PlayerHookBackupTest {
         val btrUrl = "http://127.0.0.1:45678/stream/abc123.flv"
         val rawBackups = listOf(
             "https://d1--cn-gotcha204.bilivideo.com/live-bvc/123.flv",
-            "https://d1--cn-gotcha07.bilivideo.com/live-bvc/123.flv"
+            "https://d1--cn-gotcha07.bilivideo.com/live-bvc/123.flv",
+            "https://d1--cn-gotcha08.bilivideo.com/live-bvc/123.flv"
         )
         assertEquals(
-            listOf(btrUrl),
+            listOf(btrUrl, rawBackups[0], rawBackups[1]),
             PlayerHook.computeNativeBackupsForSession(btrUrl, rawBackups, btrConfigEnabled = true)
+        )
+        // Loopback and leaked non-Akamai hdnts= URLs must be excluded from native disaster fallbacks
+        val unsafeMixed = listOf(
+            "http://127.0.0.1:45678/stream/other.m4s",
+            "http://localhost:45678/stream/other2.m4s",
+            "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.m4s?hdnts=exp=1899999999~hmac=sig",
+            "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/1/2/3.m4s?hdnts=exp=1899999999~hmac=sig",
+            "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1899999999"
+        )
+        assertEquals(
+            listOf(
+                btrUrl,
+                "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/1/2/3.m4s?hdnts=exp=1899999999~hmac=sig",
+                "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1899999999"
+            ),
+            PlayerHook.computeNativeBackupsForSession(btrUrl, unsafeMixed, btrConfigEnabled = true)
         )
         assertEquals(
             emptyList<String>(),
@@ -314,7 +331,11 @@ class PlayerHookBackupTest {
                 proceedOriginal = { builder.setBackupUrls(rawBackups) },
                 proceedWithArg = { arg -> builder.setBackupUrls(arg as List<String>) }
             )
-            assertEquals("Native backups must converge to BTR URL while bound", listOf(btrUrl!!), builder.backups)
+            assertEquals(
+                "Native backups must put BTR URL first with up to 2 safe direct disaster fallbacks",
+                listOf(btrUrl!!) + expectedRestored.take(2),
+                builder.backups
+            )
 
             // Reusing builder with DRM URL transitions out of BTR and must restore clean non-BTR backups
             val drmResult = PlayerHook.rewriteArgIfMedia(
@@ -374,7 +395,11 @@ class PlayerHookBackupTest {
         val sid = BtrSessionManager.getSessionForBuilder(builder)!!
 
         try {
-            assertEquals("Deferred backups must converge to BTR URL when VOD URL enters BTR", listOf(btrUrl!!), builder.backups.toList())
+            assertEquals(
+                "Deferred backups must place BTR URL first with safe direct fallbacks when VOD URL enters BTR",
+                listOf(btrUrl!!) + expectedRestored.take(2),
+                builder.backups.toList()
+            )
 
             // Reusing builder with local file URI / non-media URL transitions out of BTR (deferredMethod was already consumed on VOD setUrl)
             val nonHttpMediaArgs = PlayerHook.rewriteArgIfMedia(
@@ -398,7 +423,7 @@ class PlayerHookBackupTest {
             assertTrue(btrUrlMid?.startsWith("http://127.0.0.1:") == true)
             val sidMid = BtrSessionManager.getSessionForBuilder(builder)!!
             try {
-                assertEquals(listOf(btrUrlMid!!), builder.backups.toList())
+                assertEquals(listOf(btrUrlMid!!) + expectedRestored.take(2), builder.backups.toList())
                 val nonMediaArgs = PlayerHook.rewriteArgIfMedia(
                     args = listOf("https://example.com/unrelated"),
                     builderInstance = builder,
@@ -423,7 +448,7 @@ class PlayerHookBackupTest {
             assertTrue(btrUrl2?.startsWith("http://127.0.0.1:") == true)
             val sid2 = BtrSessionManager.getSessionForBuilder(builder)!!
             try {
-                assertEquals(listOf(btrUrl2!!), builder.backups.toList())
+                assertEquals(listOf(btrUrl2!!) + expectedRestored.take(2), builder.backups.toList())
 
                 val episodeArgs = PlayerHook.rewriteArgIfMedia(
                     args = listOf(episodeUrl),
@@ -472,7 +497,8 @@ class PlayerHookBackupTest {
                 proceedOriginal = { builder.setBackupUrls(rawBackups) },
                 proceedWithArg = { arg -> builder.setBackupUrls(arg as List<String>) }
             )
-            assertEquals(listOf(btrUrl!!), builder.backups)
+            val expectedFallback = PlayerHook.filterAndFillBackupUrls(rawBackups, btrConfig.copy(enableBtr = false)).take(2)
+            assertEquals(listOf(btrUrl!!) + expectedFallback, builder.backups)
 
             // Explicit empty list clears native backups
             @Suppress("UNCHECKED_CAST")
@@ -548,7 +574,7 @@ class PlayerHookBackupTest {
         assertTrue(btrUrl?.startsWith("http://127.0.0.1:") == true)
         val sid = BtrSessionManager.getSessionForBuilder(builder)!!
         try {
-            assertEquals(listOf(btrUrl!!), builder.backups)
+            assertEquals(listOf(btrUrl!!) + expectedRestored.take(2), builder.backups)
 
             // Transitioning back out via disabled episode URL restores clean backups
             assertNull(
@@ -659,7 +685,7 @@ class PlayerHookBackupTest {
                 proceedOriginal = { builder.setBackupUrls(rawBackups) },
                 proceedWithArg = { arg -> builder.setBackupUrls(arg as List<String>) }
             )
-            assertEquals(listOf(btrUrl1!!), builder.backups)
+            assertEquals(listOf(btrUrl1!!) + expectedRestored.take(2), builder.backups)
 
             // Switching to a second VOD URL must update native backups from btrUrl1 to btrUrl2
             val args2 = PlayerHook.rewriteArgIfMedia(listOf(vodUrl2), builder, btrConfig, onRewrite = null)
@@ -668,7 +694,7 @@ class PlayerHookBackupTest {
             assertFalse(btrUrl1 == btrUrl2)
             val sid2 = BtrSessionManager.getSessionForBuilder(builder)!!
             try {
-                assertEquals(listOf(btrUrl2!!), builder.backups)
+                assertEquals(listOf(btrUrl2!!) + expectedRestored.take(2), builder.backups)
 
                 // Switching to live with enableLiveAcceleration=false must restore clean backups
                 assertNull(PlayerHook.rewriteArgIfMedia(listOf(liveUrl), builder, btrConfig, onRewrite = null))
@@ -731,7 +757,7 @@ class PlayerHookBackupTest {
                 proceedWithArg = { arg -> builder.setBackupUrls(arg as Array<String>) }
             )
             assertEquals("Inner hooked overload must be suppressed during re-entrant delegation", 0, builder.innerHookInvocations)
-            assertEquals(listOf(btrUrl!!), builder.backups)
+            assertEquals(listOf(btrUrl!!) + expectedRestored.take(2), builder.backups)
             assertFalse(
                 "Session backups must never be polluted by local BTR loopback URL",
                 BtrSessionManager.get(sid)!!.backupUrls.any { it.contains("127.0.0.1:") }
@@ -1406,15 +1432,16 @@ class PlayerHookAutoVodAndEdgeCasesTest {
                 proceedOriginal = { builder.setBackupUrls(rawBackups) },
                 proceedWithArg = { arg -> builder.setBackupUrls(arg as List<String>) }
             )
-            assertEquals(listOf(btrUrl!!), builder.backups)
+            val expectedNativeBackups = listOf(btrUrl!!) + PlayerHook.filterAndFillBackupUrls(rawBackups, btrCfg.copy(enableBtr = false)).take(2)
+            assertEquals(expectedNativeBackups, builder.backups)
 
             assertNull(PlayerHook.rewriteArgIfMedia(listOf(null), builder, btrCfg, onRewrite = null, methodName = "setResolveUrl"))
             assertEquals("setResolveUrl(null) must preserve BTR binding", sid, BtrSessionManager.getSessionForBuilder(builder))
-            assertEquals("setResolveUrl(null) must NOT roll back native backups", listOf(btrUrl), builder.backups)
+            assertEquals("setResolveUrl(null) must NOT roll back native backups", expectedNativeBackups, builder.backups)
 
             assertNull(PlayerHook.rewriteArgIfMedia(listOf(""), builder, btrCfg, onRewrite = null, methodName = "setResolveUrl"))
             assertEquals("setResolveUrl(\"\") must preserve BTR binding", sid, BtrSessionManager.getSessionForBuilder(builder))
-            assertEquals("setResolveUrl(\"\") must NOT roll back native backups", listOf(btrUrl), builder.backups)
+            assertEquals("setResolveUrl(\"\") must NOT roll back native backups", expectedNativeBackups, builder.backups)
         } finally {
             BtrSessionManager.remove(sid)
         }
@@ -1484,5 +1511,158 @@ class PlayerHookAutoVodAndEdgeCasesTest {
         assertEquals("upos-sz-mirrorhw.bilivideo.com", session.activeHost)
         assertEquals("ActiveHostListener must update builder backups with winner first", hw, builder.backups.firstOrNull())
         assertEquals("ActiveHostListener must update tracked player URL", hw, PlayerHook.getTrackedAutoVodUrl(player))
+    }
+
+    @Test
+    fun testPlayerOptionHeadersCapturedAndSyncedToVideoAndAudioSessions() {
+        val btrCfg = AcceleratorConfig(enabled = true, enableBtr = true, targetHost = "upos-sz-mirrorcos.bilivideo.com")
+        val nowSec = System.currentTimeMillis() / 1000L
+        val videoUrl = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/10/20/770001-1-30080.m4s?platform=android&deadline=${nowSec + 3600}"
+        val audioUrl = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/10/20/770001-1-30280.m4s?platform=android&deadline=${nowSec + 3600}"
+        val videoBuilder = FakeBuilder()
+        val audioBuilder = FakeBuilder()
+
+        val vRes = PlayerHook.rewriteArgIfMedia(listOf(videoUrl), videoBuilder, btrCfg, onRewrite = null)
+        val aRes = PlayerHook.rewriteArgIfMedia(listOf(audioUrl), audioBuilder, btrCfg, onRewrite = null)
+        val vBtr = vRes?.get(0) as String
+        val aBtr = aRes?.get(0) as String
+        val vSid = BtrSessionManager.getSessionForBuilder(videoBuilder)!!
+        val aSid = BtrSessionManager.getSessionForBuilder(audioBuilder)!!
+
+        try {
+            val vSeg = FakeBuiltSegment(vBtr)
+            val aSeg = FakeBuiltSegment(aBtr)
+            PlayerHook.onSegmentBuilt(videoBuilder, vSeg)
+            PlayerHook.onSegmentBuilt(audioBuilder, aSeg)
+
+            val player = FakeIjkPlayer()
+            // Bad player-default UA must be ignored; valid BiliDroid UA and extra headers before bind must propagate
+            PlayerHook.recordPlayerOptionHeader(player, "user_agent", "Lavf/58.76.100")
+            PlayerHook.recordPlayerOptionHeader(
+                player,
+                "headers",
+                "User-Agent: Mozilla/5.0 BiliDroid/8.24.0 (bbcallen@gmail.com)\r\nX-Bili-Trace-Id: trace-770001\r\nHost: 127.0.0.1\r\nRange: bytes=0-10\r\n"
+            )
+            PlayerHook.bindPlayerToAsset(player, FakeMediaAsset(listOf(vSeg, aSeg)))
+
+            val vSession = BtrSessionManager.get(vSid)!!
+            val aSession = BtrSessionManager.get(aSid)!!
+            assertEquals("Mozilla/5.0 BiliDroid/8.24.0 (bbcallen@gmail.com)", vSession.userAgent)
+            assertEquals("Mozilla/5.0 BiliDroid/8.24.0 (bbcallen@gmail.com)", aSession.userAgent)
+            assertNull("platform=android stream without explicit Referer must keep null referer", vSession.referer)
+            assertNull("platform=android audio stream without explicit Referer must keep null referer", aSession.referer)
+            assertEquals("trace-770001", vSession.extraHeaders["X-Bili-Trace-Id"])
+            assertEquals("trace-770001", aSession.extraHeaders["X-Bili-Trace-Id"])
+            assertFalse("Hop-by-hop Host header must not be forwarded", vSession.extraHeaders.containsKey("Host"))
+            assertFalse("Range header must not be forwarded", vSession.extraHeaders.containsKey("Range"))
+
+            // Post-bind setOption must also update both video & audio sessions
+            PlayerHook.recordPlayerOptionHeader(player, "referer", "https://www.bilibili.com/bangumi/play/")
+            assertEquals("https://www.bilibili.com/bangumi/play/", vSession.referer)
+            assertEquals("https://www.bilibili.com/bangumi/play/", aSession.referer)
+
+            PlayerHook.handlePlayerResetOrRelease(player)
+        } finally {
+            BtrSessionManager.remove(vSid)
+            BtrSessionManager.remove(aSid)
+        }
+    }
+
+    @Test
+    fun testPcdnPrimaryDoesNotSynthesizePoisonedMirrorsAndPromotesRealOfficialBackupLater() {
+        val btrCfg = AcceleratorConfig(enabled = true, enableBtr = true, blockPcdn = true, targetHost = "upos-sz-mirrorcos.bilivideo.com")
+        val nowSec = System.currentTimeMillis() / 1000L
+        val pcdnPrimary = "http://112.34.56.78:8080/upgcxcode/54/12/777001.m4s?upsig=pcdn_only_sig&deadline=${nowSec + 3600}"
+        val realOfficialBackup = "https://upos-sz-mirrorhw.bilivideo.com/upgcxcode/54/12/777001.m4s?upsig=real_upos_sig&deadline=${nowSec + 3600}"
+        val pcdnBackup = "http://221.192.1.2:8080/upgcxcode/54/12/777001.m4s?upsig=pcdn_only_sig&deadline=${nowSec + 3600}"
+
+        val builder = FakeBuilder()
+        val setBackupMethod = FakeBuilder::class.java.getMethod("setBackupUrls", List::class.java)
+        val res = PlayerHook.rewriteArgIfMedia(listOf(pcdnPrimary), builder, btrCfg, onRewrite = null)
+        assertTrue((res?.get(0) as? String)?.startsWith("http://127.0.0.1:") == true)
+        val sid = BtrSessionManager.getSessionForBuilder(builder)!!
+
+        try {
+            val session = BtrSessionManager.get(sid)!!
+            assertTrue("Session must mark primary as rewritten from untrusted PCDN", session.primaryIsRewrittenFromUntrusted)
+            assertTrue(
+                "Poisoned PCDN primary must NOT synthesize 7 fake UPOS mirrors with PCDN signature",
+                session.synthesizedMirrors.isEmpty()
+            )
+            assertTrue("Original PCDN primary must be preserved as fallback", session.backupUrls.contains(pcdnPrimary))
+
+            // Player later delivers setBackupUrls containing a genuine official UPOS backup with its own signature
+            @Suppress("UNCHECKED_CAST")
+            PlayerHook.interceptSetBackupUrls(
+                builder = builder,
+                method = setBackupMethod,
+                rawArg = listOf(pcdnBackup, realOfficialBackup),
+                config = btrCfg,
+                onRewrite = null,
+                proceedOriginal = { builder.setBackupUrls(listOf(pcdnBackup, realOfficialBackup)) },
+                proceedWithArg = { arg -> builder.setBackupUrls(arg as List<String>) }
+            )
+
+            assertEquals("Real official UPOS backup must be promoted to primaryUrl", realOfficialBackup, session.primaryUrl)
+            assertFalse("primaryIsRewrittenFromUntrusted must reset after official promotion", session.primaryIsRewrittenFromUntrusted)
+            assertTrue("Promoted official UPOS donor must synthesize clean UPOS mirrors", session.synthesizedMirrors.isNotEmpty())
+            assertTrue(
+                "All synthesized mirrors must use real_upos_sig, never pcdn_only_sig",
+                session.synthesizedMirrors.all { it.contains("upsig=real_upos_sig") && !it.contains("pcdn_only_sig") }
+            )
+            assertFalse(
+                "Poisoned fake UPOS primary must be purged after official promotion",
+                session.currentCandidateUrls().any { it.contains("upos-sz-mirrorcos.bilivideo.com") && it.contains("pcdn_only_sig") }
+            )
+            assertTrue("Original raw PCDN URL stays as last-resort fallback", session.backupUrls.contains(pcdnPrimary))
+        } finally {
+            BtrSessionManager.remove(sid)
+        }
+    }
+
+    @Test
+    fun testBcachePrimaryNotSwappedWithoutBackupAndPromotesOfficialBackupWhenPresent() {
+        val btrCfg = AcceleratorConfig(enabled = true, enableBtr = true, blockPcdn = true, forceUpos = true, targetHost = "upos-sz-mirrorcos.bilivideo.com")
+        val nowSec = System.currentTimeMillis() / 1000L
+        val bcacheUrl = "https://cn-zj-hz-bcache-01.bilivideo.com/upgcxcode/54/12/777002.m4s?os=bcache&upsig=edge_sig&deadline=${nowSec + 3600}"
+        val officialUpos = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/54/12/777002.m4s?os=upos&upsig=upos_sig&deadline=${nowSec + 3600}"
+
+        // 1. Without clean backup: bcache stays untouched in BTR with no synthesized UPOS mirrors
+        val builder1 = FakeBuilder()
+        val res1 = PlayerHook.rewriteArgIfMedia(listOf(bcacheUrl), builder1, btrCfg, onRewrite = null)
+        assertTrue((res1?.get(0) as? String)?.startsWith("http://127.0.0.1:") == true)
+        val sid1 = BtrSessionManager.getSessionForBuilder(builder1)!!
+        try {
+            val session1 = BtrSessionManager.get(sid1)!!
+            assertEquals("bcache primary must not be swapped to mirrorcos without clean backup", bcacheUrl, session1.primaryUrl)
+            assertTrue("bcache primary must not synthesize UPOS mirrors", session1.synthesizedMirrors.isEmpty())
+        } finally {
+            BtrSessionManager.remove(sid1)
+        }
+
+        // 2. With clean official UPOS backup: bcache promotes clean official UPOS immediately
+        val builder2 = FakeBuilder()
+        val setBackupMethod = FakeBuilder::class.java.getMethod("setBackupUrls", List::class.java)
+        @Suppress("UNCHECKED_CAST")
+        PlayerHook.interceptSetBackupUrls(
+            builder = builder2,
+            method = setBackupMethod,
+            rawArg = listOf(officialUpos),
+            config = btrCfg,
+            onRewrite = null,
+            proceedOriginal = { builder2.setBackupUrls(listOf(officialUpos)) },
+            proceedWithArg = { arg -> builder2.setBackupUrls(arg as List<String>) }
+        )
+        val res2 = PlayerHook.rewriteArgIfMedia(listOf(bcacheUrl), builder2, btrCfg, onRewrite = null)
+        assertTrue((res2?.get(0) as? String)?.startsWith("http://127.0.0.1:") == true)
+        val sid2 = BtrSessionManager.getSessionForBuilder(builder2)!!
+        try {
+            val session2 = BtrSessionManager.get(sid2)!!
+            assertEquals("Clean official UPOS backup must be promoted over bcache primary", officialUpos, session2.primaryUrl)
+            assertTrue("Promoted official UPOS must synthesize mirrors", session2.synthesizedMirrors.isNotEmpty())
+            assertTrue("Original bcache URL must remain as fallback", session2.backupUrls.contains(bcacheUrl))
+        } finally {
+            BtrSessionManager.remove(sid2)
+        }
     }
 }

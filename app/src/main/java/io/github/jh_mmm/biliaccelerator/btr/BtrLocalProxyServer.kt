@@ -114,6 +114,88 @@ object BtrLocalProxyServer {
         port = -1
     }
 
+    private val NON_FORWARDABLE_HEADERS = setOf(
+        "host",
+        "range",
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+        "accept-encoding",
+        "accept",
+        "content-length",
+        "content-type",
+        "expect",
+        "icy-metadata",
+        "if-range",
+        "if-match",
+        "if-none-match",
+        "if-modified-since",
+        "if-unmodified-since",
+        "user-agent",
+        "referer"
+    )
+
+    internal fun isUsableClientUserAgent(rawUa: String?): Boolean {
+        val ua = rawUa?.trim() ?: return false
+        if (ua.isEmpty()) return false
+        val lower = ua.lowercase()
+        return !lower.startsWith("dalvik/") &&
+            !lower.startsWith("java/") &&
+            !lower.startsWith("lavf/") &&
+            !lower.startsWith("libavformat") &&
+            !lower.startsWith("stagefright") &&
+            !lower.startsWith("ijkplayer") &&
+            !lower.startsWith("okhttp/") &&
+            !lower.startsWith("apache-httpclient") &&
+            !lower.contains("stagefright/")
+    }
+
+    internal fun isAllowedReferer(rawRef: String?): Boolean {
+        val ref = rawRef?.trim() ?: return false
+        if (ref.isEmpty()) return false
+        return ref.contains("bilibili.com", ignoreCase = true) ||
+            ref.contains("biliintl.com", ignoreCase = true) ||
+            ref.contains("bilibili.tv", ignoreCase = true) ||
+            ref.contains("bstarstatic.com", ignoreCase = true) ||
+            ref.contains("bilivideo.com", ignoreCase = true) ||
+            ref.contains("hdslb.com", ignoreCase = true)
+    }
+
+    internal fun extractForwardableExtraHeaders(
+        rawHeaders: Map<String, String>,
+        sessionExtraHeaders: Map<String, String> = emptyMap()
+    ): Map<String, String> {
+        if (rawHeaders.isEmpty() && sessionExtraHeaders.isEmpty()) return emptyMap()
+        val merged = LinkedHashMap<String, String>()
+        val lowerToKey = HashMap<String, String>()
+        fun putIfValid(kRaw: String, vRaw: String) {
+            val k = kRaw.trim()
+            val v = vRaw.trim()
+            if (k.isEmpty() || v.isEmpty()) return
+            val kl = k.lowercase()
+            if (kl in NON_FORWARDABLE_HEADERS) return
+            val prevKey = lowerToKey[kl]
+            if (prevKey != null && prevKey != k) {
+                merged.remove(prevKey)
+            }
+            lowerToKey[kl] = k
+            merged[k] = v
+        }
+        for ((k, v) in sessionExtraHeaders) {
+            putIfValid(k, v)
+        }
+        for ((k, v) in rawHeaders) {
+            putIfValid(k, v)
+        }
+        return merged
+    }
+
     private fun handleClientSocket(socket: Socket) {
         socket.use { s ->
             try {
@@ -193,15 +275,11 @@ object BtrLocalProxyServer {
                         break
                     }
 
-                    // 仅按单次请求透传合法 User-Agent / Referer，避免探测或异常请求头永久污染 session 共享状态
+                    // 仅按单次请求透传合法 User-Agent / Referer / 扩展头，过滤 Dalvik/Java/Lavf/stagefright 等底层库默认 UA 避免触发 403
                     val reqUserAgent = headers["user-agent"]
                         ?.trim()
-                        ?.takeIf {
-                            it.isNotBlank() &&
-                                !it.startsWith("Dalvik/", ignoreCase = true) &&
-                                !it.startsWith("Java/", ignoreCase = true)
-                        }
-                        ?: session.userAgent
+                        ?.takeIf { isUsableClientUserAgent(it) }
+                        ?: session.userAgent?.takeIf { isUsableClientUserAgent(it) }
                     if (session.userAgent.isNullOrBlank() && !reqUserAgent.isNullOrBlank()) {
                         synchronized(session.urlLock) {
                             if (session.userAgent.isNullOrBlank()) {
@@ -209,17 +287,11 @@ object BtrLocalProxyServer {
                             }
                         }
                     }
-                    val reqReferer = headers["referer"]
+                    val reqReferer: String? = headers["referer"]
                         ?.trim()
-                        ?.takeIf { ref ->
-                            ref.isNotBlank() && (
-                                ref.contains("bilibili.com", ignoreCase = true) ||
-                                    ref.contains("biliintl.com", ignoreCase = true) ||
-                                    ref.contains("bilibili.tv", ignoreCase = true) ||
-                                    ref.contains("bstarstatic.com", ignoreCase = true)
-                                )
-                        }
+                        ?.takeIf { isAllowedReferer(it) }
                         ?: session.referer
+                    val reqExtraHeaders = extractForwardableExtraHeaders(headers, session.extraHeaders)
 
                     val requestPathOnly = path.substringBefore('?')
                     val keepConnectionAlive = if (session.isLive) {
@@ -234,7 +306,8 @@ object BtrLocalProxyServer {
                                     keepAlive = shouldKeepAlive,
                                     isHeadOnly = isHeadOnly,
                                     requestUserAgent = reqUserAgent,
-                                    requestReferer = reqReferer
+                                    requestReferer = reqReferer,
+                                    extraHeaders = reqExtraHeaders
                                 )
                             }
                             requestPathOnly.endsWith(".flv", ignoreCase = true) -> {
@@ -244,7 +317,8 @@ object BtrLocalProxyServer {
                                     clientOut = out,
                                     isHeadOnly = isHeadOnly,
                                     requestUserAgent = reqUserAgent,
-                                    requestReferer = reqReferer
+                                    requestReferer = reqReferer,
+                                    extraHeaders = reqExtraHeaders
                                 )
                             }
                             else -> {
@@ -256,7 +330,8 @@ object BtrLocalProxyServer {
                                     keepAlive = shouldKeepAlive,
                                     isHeadOnly = isHeadOnly,
                                     requestUserAgent = reqUserAgent,
-                                    requestReferer = reqReferer
+                                    requestReferer = reqReferer,
+                                    extraHeaders = reqExtraHeaders
                                 )
                             }
                         }
@@ -284,7 +359,8 @@ object BtrLocalProxyServer {
                             parsedRange = parsedRange,
                             keepAlive = shouldKeepAlive,
                             requestUserAgent = reqUserAgent,
-                            requestReferer = reqReferer
+                            requestReferer = reqReferer,
+                            requestExtraHeaders = reqExtraHeaders
                         )
                     }
 

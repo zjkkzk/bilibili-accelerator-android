@@ -34,7 +34,85 @@ object BtrChunkEngine {
 
     private const val MAX_PREFETCH_CHUNKS = 8           // 基础滑动窗口参考值
     private const val MAX_BUFFER_BYTES = 16L * 1024 * 1024 // 单流内存缓存上限 16MB，防 OOM 同时避免队头阻塞
-    private const val DEFAULT_USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36 BiliApp/7800300"
+    internal const val FALLBACK_PLAYER_USER_AGENT = "Bilibili Freedoooooom/MarkII"
+    internal const val WEB_COMPAT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+    internal fun resolveDefaultUserAgent(): String {
+        return RemoteClient.resolveHostPlayerUserAgent().takeIf { it.isNotBlank() }
+            ?: FALLBACK_PLAYER_USER_AGENT
+    }
+
+    private fun buildUpstreamRequest(
+        url: String,
+        userAgent: String,
+        referer: String?,
+        extraHeaders: Map<String, String> = emptyMap(),
+        rangeHeader: String? = null,
+        closeConnection: Boolean = false,
+        isHeadOnly: Boolean = false
+    ): Request {
+        val builder = Request.Builder().url(url)
+        for ((k, v) in extraHeaders) {
+            if (k.isNotBlank() && v.isNotBlank()) {
+                builder.header(k, v)
+            }
+        }
+        if (!rangeHeader.isNullOrBlank()) {
+            builder.header("Range", rangeHeader)
+        }
+        if (!referer.isNullOrBlank()) {
+            builder.header("Referer", referer)
+        }
+        builder.header("User-Agent", userAgent)
+        if (closeConnection) {
+            builder.header("Connection", "close")
+        }
+        if (isHeadOnly) {
+            builder.head()
+        }
+        return builder.build()
+    }
+
+    /**
+     * 403 请求头兼容性备选画像：当首片探针遭遇 403 且 URL 未过期时，
+     * 有限度切换 Referer 有无及 UA（BiliDroid / MarkII / 桌面 Web Chrome），避免因客户端头与 CDN 校验口径不匹配导致全节点误熔断。
+     */
+    internal fun computeAlternateHeaderProfiles(
+        session: BtrMediaSession,
+        currentUserAgent: String,
+        currentReferer: String?
+    ): List<Pair<String, String?>> {
+        val defaultWebRef = BtrSessionManager.defaultWebRefererFor(
+            isEpisode = session.isEpisode,
+            isLive = session.isLive
+        )
+        val defaultPlayerUa = resolveDefaultUserAgent()
+        val rawProfiles = if (currentReferer.isNullOrBlank()) {
+            listOf(
+                currentUserAgent to defaultWebRef,
+                FALLBACK_PLAYER_USER_AGENT to null,
+                WEB_COMPAT_USER_AGENT to defaultWebRef
+            )
+        } else {
+            listOf(
+                FALLBACK_PLAYER_USER_AGENT to null,
+                WEB_COMPAT_USER_AGENT to currentReferer,
+                defaultPlayerUa to null
+            )
+        }
+        val currentKey = "$currentUserAgent\u0000${currentReferer ?: ""}"
+        val seen = LinkedHashSet<String>()
+        seen.add(currentKey)
+        val result = ArrayList<Pair<String, String?>>(3)
+        for (pair in rawProfiles) {
+            val key = "${pair.first}\u0000${pair.second ?: ""}"
+            if (seen.add(key)) {
+                result.add(pair)
+                if (result.size >= 3) break
+            }
+        }
+        return result
+    }
     private const val RESUME_MIN_BYTES = 32 * 1024      // 断点续传拼接最低字节门槛（对齐 BTR 原版）
     internal const val SPEED_SAMPLE_MIN_BYTES = 48 * 1024L // 测速最小字节门槛（对齐 BTR SPEED_SAMPLE_MIN_BYTES = 48 KiB）
     private const val CANCEL_SPEED_MIN_BYTES = SPEED_SAMPLE_MIN_BYTES // 被取消竞争请求记录历史带宽门槛（对齐 BTR 48KB）
@@ -1498,7 +1576,8 @@ object BtrChunkEngine {
         ),
         keepAlive: Boolean = false,
         requestUserAgent: String? = null,
-        requestReferer: String? = null
+        requestReferer: String? = null,
+        requestExtraHeaders: Map<String, String> = emptyMap()
     ): Boolean {
         if (parsedRange.isInvalid) {
             sendHttp416(clientOut, session.totalLength.takeIf { it > 0L })
@@ -1506,10 +1585,15 @@ object BtrChunkEngine {
         }
 
         val isAudio = session.isAudio || BiliAcceleratorCore.isAudioTrack(session.primaryUrl)
-        val effectiveUserAgent = requestUserAgent?.takeIf { it.isNotBlank() }
-            ?: session.userAgent?.takeIf { it.isNotBlank() }
-            ?: DEFAULT_USER_AGENT
-        val effectiveReferer = requestReferer?.takeIf { it.isNotBlank() } ?: session.referer
+        var effectiveUserAgent = requestUserAgent?.takeIf { BtrLocalProxyServer.isUsableClientUserAgent(it) }
+            ?: session.userAgent?.takeIf { BtrLocalProxyServer.isUsableClientUserAgent(it) }
+            ?: resolveDefaultUserAgent()
+        var effectiveReferer: String? = requestReferer?.takeIf { it.isNotBlank() } ?: session.referer
+        var effectiveExtraHeaders: Map<String, String> = if (requestExtraHeaders.isNotEmpty()) {
+            requestExtraHeaders
+        } else {
+            session.extraHeaders
+        }
 
         val requestedBytes = if (parsedRange.hasRange && parsedRange.end != null && parsedRange.end >= parsedRange.start) {
             parsedRange.end - parsedRange.start + 1
@@ -1586,6 +1670,110 @@ object BtrChunkEngine {
             val actualEnd: Long
             var deferHeadersUntilFirstChunk = false
 
+            fun probeWith403Recovery(probeStart: Long, probeSize: Long): ProbeOutcome {
+                var outcome = probeMediaOutcome(
+                    urls = candidateUrls,
+                    session = session,
+                    startOffset = probeStart,
+                    chunkSize = probeSize,
+                    userAgent = effectiveUserAgent,
+                    referer = effectiveReferer,
+                    extraHeaders = effectiveExtraHeaders,
+                    concurrencyController = concurrencyController,
+                    streamCallKey = streamCallKey
+                )
+                if (outcome.result != null || !outcome.sawForbidden403) {
+                    return outcome
+                }
+
+                // 1. 链接已过期或候选签名已更新时优先触发一次签名刷新重试
+                var didRefresh = false
+                if (session.currentCandidateUrls() != candidateUrls || isUrlExpired(session)) {
+                    didRefresh = true
+                    if (session.currentCandidateUrls() == candidateUrls) {
+                        BtrSessionManager.maybeTriggerProactiveRefresh(session, forceOnAuthFailure = true)
+                    }
+                    val refreshedUrls = session.currentCandidateUrls()
+                    if (refreshedUrls != candidateUrls) {
+                        candidateUrls = refreshedUrls
+                        outcome = probeMediaOutcome(
+                            urls = candidateUrls,
+                            session = session,
+                            startOffset = probeStart,
+                            chunkSize = probeSize,
+                            userAgent = effectiveUserAgent,
+                            referer = effectiveReferer,
+                            extraHeaders = effectiveExtraHeaders,
+                            concurrencyController = concurrencyController,
+                            streamCallKey = streamCallKey
+                        )
+                        if (outcome.result != null || !outcome.sawForbidden403) {
+                            return outcome
+                        }
+                    }
+                }
+
+                // 2. 链接未过期但全节点 403：尝试有限次请求头兼容性重试（切换 Referer / UA）
+                if (!isUrlExpired(session)) {
+                    val altProfiles = computeAlternateHeaderProfiles(session, effectiveUserAgent, effectiveReferer)
+                    for ((altUa, altRef) in altProfiles) {
+                        val altExtra = if (altRef.isNullOrBlank()) {
+                            effectiveExtraHeaders.filterKeys { !it.equals("Origin", ignoreCase = true) }
+                        } else {
+                            effectiveExtraHeaders
+                        }
+                        val altOutcome = probeMediaOutcome(
+                            urls = candidateUrls,
+                            session = session,
+                            startOffset = probeStart,
+                            chunkSize = probeSize,
+                            userAgent = altUa,
+                            referer = altRef,
+                            extraHeaders = altExtra,
+                            concurrencyController = concurrencyController,
+                            streamCallKey = streamCallKey
+                        )
+                        if (altOutcome.result != null) {
+                            effectiveUserAgent = altUa
+                            effectiveReferer = altRef
+                            effectiveExtraHeaders = altExtra
+                            synchronized(session.urlLock) {
+                                session.userAgent = altUa
+                                session.referer = altRef
+                                session.extraHeaders = altExtra
+                            }
+                            session.banList.clearTransient4xxRefusals()
+                            Log.i(
+                                TAG,
+                                "BTR 403 header-compat recovery succeeded: session=${session.sessionId}, referer=${altRef ?: "<none>"}, ua=${altUa.take(48)}"
+                            )
+                            return altOutcome
+                        }
+                    }
+                }
+
+                // 3. 若此前尚未执行签名刷新（未过期 403 且请求头切换仍失败），最后触发一次强制签名刷新重试
+                if (!didRefresh &&
+                    (session.currentCandidateUrls() != candidateUrls ||
+                        BtrSessionManager.maybeTriggerProactiveRefresh(session, forceOnAuthFailure = true) ||
+                        session.currentCandidateUrls() != candidateUrls)
+                ) {
+                    candidateUrls = session.currentCandidateUrls()
+                    outcome = probeMediaOutcome(
+                        urls = candidateUrls,
+                        session = session,
+                        startOffset = probeStart,
+                        chunkSize = probeSize,
+                        userAgent = effectiveUserAgent,
+                        referer = effectiveReferer,
+                        extraHeaders = effectiveExtraHeaders,
+                        concurrencyController = concurrencyController,
+                        streamCallKey = streamCallKey
+                    )
+                }
+                return outcome
+            }
+
             if (parsedRange.isSuffix) {
                 if (parsedRange.suffixLength <= 0L) {
                     sendHttp416(clientOut, session.totalLength.takeIf { it > 0L })
@@ -1596,34 +1784,7 @@ object BtrChunkEngine {
                     totalLength = session.totalLength
                     contentType = session.contentType ?: if (isAudio) "audio/mp4" else "video/mp4"
                 } else {
-                    var outcome = probeMediaOutcome(
-                        urls = candidateUrls,
-                        session = session,
-                        startOffset = 0L,
-                        chunkSize = initialProbeChunkSize,
-                        userAgent = effectiveUserAgent,
-                        referer = effectiveReferer,
-                        concurrencyController = concurrencyController,
-                        streamCallKey = streamCallKey
-                    )
-                    if (outcome.result == null &&
-                        outcome.sawForbidden403 &&
-                        (session.currentCandidateUrls() != candidateUrls ||
-                            BtrSessionManager.maybeTriggerProactiveRefresh(session, forceOnAuthFailure = true) ||
-                            session.currentCandidateUrls() != candidateUrls)
-                    ) {
-                        candidateUrls = session.currentCandidateUrls()
-                        outcome = probeMediaOutcome(
-                            urls = candidateUrls,
-                            session = session,
-                            startOffset = 0L,
-                            chunkSize = initialProbeChunkSize,
-                            userAgent = effectiveUserAgent,
-                            referer = effectiveReferer,
-                            concurrencyController = concurrencyController,
-                            streamCallKey = streamCallKey
-                        )
-                    }
+                    val outcome = probeWith403Recovery(0L, initialProbeChunkSize)
                     val probeResult = outcome.result
                     if (probeResult == null) {
                         if (outcome.sawRangeNotSatisfiable416 && !outcome.sawForbidden403) {
@@ -1703,34 +1864,7 @@ object BtrChunkEngine {
                     deferHeadersUntilFirstChunk = true
                 } else {
                     // 首片 64KB 竞速探针 (多源并发对冲探针，快速返回 HTTP 响应头)
-                    var outcome = probeMediaOutcome(
-                        urls = candidateUrls,
-                        session = session,
-                        startOffset = effectiveStart,
-                        chunkSize = initialProbeChunkSize,
-                        userAgent = effectiveUserAgent,
-                        referer = effectiveReferer,
-                        concurrencyController = concurrencyController,
-                        streamCallKey = streamCallKey
-                    )
-                    if (outcome.result == null &&
-                        outcome.sawForbidden403 &&
-                        (session.currentCandidateUrls() != candidateUrls ||
-                            BtrSessionManager.maybeTriggerProactiveRefresh(session, forceOnAuthFailure = true) ||
-                            session.currentCandidateUrls() != candidateUrls)
-                    ) {
-                        candidateUrls = session.currentCandidateUrls()
-                        outcome = probeMediaOutcome(
-                            urls = candidateUrls,
-                            session = session,
-                            startOffset = effectiveStart,
-                            chunkSize = initialProbeChunkSize,
-                            userAgent = effectiveUserAgent,
-                            referer = effectiveReferer,
-                            concurrencyController = concurrencyController,
-                            streamCallKey = streamCallKey
-                        )
-                    }
+                    val outcome = probeWith403Recovery(effectiveStart, initialProbeChunkSize)
                     val probeResult = outcome.result
                     if (probeResult == null) {
                         if (outcome.sawRangeNotSatisfiable416 && !outcome.sawForbidden403) {
@@ -1757,6 +1891,7 @@ object BtrChunkEngine {
                             isHeadOnly = isHeadOnly,
                             userAgent = effectiveUserAgent,
                             referer = effectiveReferer,
+                            extraHeaders = effectiveExtraHeaders,
                             clientOut = clientOut,
                             statsTracker = statsTracker,
                             streamCallKey = streamCallKey
@@ -1902,6 +2037,7 @@ object BtrChunkEngine {
                     chunkSize = activeChunkSize,
                     userAgent = effectiveUserAgent,
                     referer = effectiveReferer,
+                    extraHeaders = effectiveExtraHeaders,
                     clientOut = clientOut,
                     statsTracker = statsTracker,
                     streamCallKey = streamCallKey,
@@ -2031,6 +2167,7 @@ object BtrChunkEngine {
                                         session = session,
                                         userAgent = effectiveUserAgent,
                                         referer = effectiveReferer,
+                                        extraHeaders = effectiveExtraHeaders,
                                         statsTracker = statsTracker,
                                         concurrencyController = concurrencyController,
                                         isClientAborted = isClientAborted,
@@ -2294,7 +2431,8 @@ object BtrChunkEngine {
         session: BtrMediaSession,
         isHeadOnly: Boolean,
         userAgent: String,
-        referer: String,
+        referer: String?,
+        extraHeaders: Map<String, String> = emptyMap(),
         clientOut: OutputStream,
         statsTracker: StreamStatsTracker,
         streamCallKey: String
@@ -2302,13 +2440,14 @@ object BtrChunkEngine {
         val host = extractHostname(url)
         val startTime = System.currentTimeMillis()
         val okClient = if (session.isAudio) BtrHttpClient.audioStreamClient else BtrHttpClient.client
-        val builder = Request.Builder()
-            .url(url)
-            .header("Referer", referer)
-            .header("User-Agent", userAgent)
-            .header("Connection", "close")
-        if (isHeadOnly) builder.head()
-        val request = builder.build()
+        val request = buildUpstreamRequest(
+            url = url,
+            userAgent = userAgent,
+            referer = referer,
+            extraHeaders = extraHeaders,
+            closeConnection = true,
+            isHeadOnly = isHeadOnly
+        )
 
         val call = okClient.newCall(request)
         val trackedCall = TrackedCall(call)
@@ -2374,7 +2513,8 @@ object BtrChunkEngine {
         startOffset: Long,
         chunkSize: Long,
         userAgent: String,
-        referer: String,
+        referer: String?,
+        extraHeaders: Map<String, String> = emptyMap(),
         clientOut: OutputStream,
         statsTracker: StreamStatsTracker,
         streamCallKey: String,
@@ -2396,12 +2536,13 @@ object BtrChunkEngine {
             for (url in candidates) {
                 val host = extractHostname(url)
                 val startTime = System.currentTimeMillis()
-                val req = Request.Builder()
-                    .url(url)
-                    .header("Range", "bytes=$offset-$reqEnd")
-                    .header("Referer", referer)
-                    .header("User-Agent", userAgent)
-                    .build()
+                val req = buildUpstreamRequest(
+                    url = url,
+                    userAgent = userAgent,
+                    referer = referer,
+                    extraHeaders = extraHeaders,
+                    rangeHeader = "bytes=$offset-$reqEnd"
+                )
                 val call = okClient.newCall(req)
                 val trackedCall = TrackedCall(call)
                 registerStreamCall(streamCallKey, session.sessionId, trackedCall)
@@ -2526,7 +2667,8 @@ object BtrChunkEngine {
         startOffset: Long,
         chunkSize: Long,
         userAgent: String,
-        referer: String,
+        referer: String?,
+        extraHeaders: Map<String, String> = emptyMap(),
         okClient: okhttp3.OkHttpClient,
         primaryHost: String,
         concurrencyController: DynamicConcurrencyController?,
@@ -2542,12 +2684,13 @@ object BtrChunkEngine {
         val host = extractHostname(url)
         val startTime = System.currentTimeMillis()
         val endOffset = startOffset + chunkSize - 1
-        val request = Request.Builder()
-            .url(url)
-            .header("Range", "bytes=$startOffset-$endOffset")
-            .header("Referer", referer)
-            .header("User-Agent", userAgent)
-            .build()
+        val request = buildUpstreamRequest(
+            url = url,
+            userAgent = userAgent,
+            referer = referer,
+            extraHeaders = extraHeaders,
+            rangeHeader = "bytes=$startOffset-$endOffset"
+        )
 
         val call = okClient.newCall(request)
         val trackedCall = TrackedCall(call)
@@ -2698,7 +2841,8 @@ object BtrChunkEngine {
         startOffset: Long,
         chunkSize: Long,
         userAgent: String,
-        referer: String,
+        referer: String?,
+        extraHeaders: Map<String, String> = emptyMap(),
         okClient: okhttp3.OkHttpClient,
         primaryHost: String,
         concurrencyController: DynamicConcurrencyController?,
@@ -2711,9 +2855,19 @@ object BtrChunkEngine {
         if (batch.isEmpty()) return null
         if (batch.size == 1) {
             return executeSingleProbe(
-                batch[0], session, startOffset, chunkSize, userAgent, referer,
-                okClient, primaryHost, concurrencyController,
-                activeCalls = null, isDecided = null, streamCallKey = streamCallKey,
+                url = batch[0],
+                session = session,
+                startOffset = startOffset,
+                chunkSize = chunkSize,
+                userAgent = userAgent,
+                referer = referer,
+                extraHeaders = extraHeaders,
+                okClient = okClient,
+                primaryHost = primaryHost,
+                concurrencyController = concurrencyController,
+                activeCalls = null,
+                isDecided = null,
+                streamCallKey = streamCallKey,
                 sawForbidden403 = sawForbidden403,
                 sawRangeNotSatisfiable416 = saw416,
                 totalLengthFrom416 = total416,
@@ -2753,9 +2907,20 @@ object BtrChunkEngine {
                         }
 
                         val probeRes = executeSingleProbe(
-                            url, session, startOffset, chunkSize, userAgent, referer,
-                            okClient, primaryHost, concurrencyController,
-                            activeCalls, isDecided, streamCallKey, sawForbidden403,
+                            url = url,
+                            session = session,
+                            startOffset = startOffset,
+                            chunkSize = chunkSize,
+                            userAgent = userAgent,
+                            referer = referer,
+                            extraHeaders = extraHeaders,
+                            okClient = okClient,
+                            primaryHost = primaryHost,
+                            concurrencyController = concurrencyController,
+                            activeCalls = activeCalls,
+                            isDecided = isDecided,
+                            streamCallKey = streamCallKey,
+                            sawForbidden403 = sawForbidden403,
                             sawRangeNotSatisfiable416 = saw416,
                             totalLengthFrom416 = total416,
                             primaryFailReason = primaryFailReason
@@ -2810,7 +2975,8 @@ object BtrChunkEngine {
         startOffset: Long,
         chunkSize: Long,
         userAgent: String,
-        referer: String,
+        referer: String?,
+        extraHeaders: Map<String, String> = emptyMap(),
         concurrencyController: DynamicConcurrencyController? = null,
         streamCallKey: String? = null
     ): ProbeOutcome {
@@ -2853,6 +3019,7 @@ object BtrChunkEngine {
             chunkSize = chunkSize,
             userAgent = userAgent,
             referer = referer,
+            extraHeaders = extraHeaders,
             okClient = okClient,
             primaryHost = primaryHost,
             concurrencyController = concurrencyController,
@@ -2887,6 +3054,7 @@ object BtrChunkEngine {
                 chunkSize = chunkSize,
                 userAgent = userAgent,
                 referer = referer,
+                extraHeaders = extraHeaders,
                 okClient = okClient,
                 primaryHost = primaryHost,
                 concurrencyController = concurrencyController,
@@ -2907,7 +3075,8 @@ object BtrChunkEngine {
         task: ChunkTask,
         session: BtrMediaSession,
         userAgent: String,
-        referer: String,
+        referer: String?,
+        extraHeaders: Map<String, String> = emptyMap(),
         statsTracker: StreamStatsTracker,
         concurrencyController: DynamicConcurrencyController?,
         isClientAborted: AtomicBoolean,
@@ -3052,6 +3221,7 @@ object BtrChunkEngine {
                                     session = session,
                                     userAgent = userAgent,
                                     referer = referer,
+                                    extraHeaders = extraHeaders,
                                     statsTracker = statsTracker,
                                     concurrencyController = concurrencyController,
                                     hasWinner = hasWinner,
@@ -3077,6 +3247,7 @@ object BtrChunkEngine {
                     session = session,
                     userAgent = userAgent,
                     referer = referer,
+                    extraHeaders = extraHeaders,
                     statsTracker = statsTracker,
                     concurrencyController = concurrencyController,
                     hasWinner = hasWinner,
@@ -3139,6 +3310,7 @@ object BtrChunkEngine {
                         session = session,
                         userAgent = userAgent,
                         referer = referer,
+                        extraHeaders = extraHeaders,
                         statsTracker = statsTracker,
                         concurrencyController = concurrencyController,
                         hasWinner = hasWinner,
@@ -3200,6 +3372,7 @@ object BtrChunkEngine {
                 session = session,
                 userAgent = userAgent,
                 referer = referer,
+                extraHeaders = extraHeaders,
                 statsTracker = statsTracker,
                 concurrencyController = concurrencyController,
                 streamCallKey = streamCallKey,
@@ -3220,7 +3393,8 @@ object BtrChunkEngine {
         url: String,
         session: BtrMediaSession,
         userAgent: String,
-        referer: String,
+        referer: String?,
+        extraHeaders: Map<String, String> = emptyMap(),
         statsTracker: StreamStatsTracker,
         concurrencyController: DynamicConcurrencyController?,
         hasWinner: AtomicBoolean,
@@ -3247,12 +3421,13 @@ object BtrChunkEngine {
         val needBytes = (task.endByte - requestStart + 1).toInt()
         if (needBytes <= 0) return
 
-        val request = Request.Builder()
-            .url(url)
-            .header("Range", "bytes=$requestStart-${task.endByte}")
-            .header("Referer", referer)
-            .header("User-Agent", userAgent)
-            .build()
+        val request = buildUpstreamRequest(
+            url = url,
+            userAgent = userAgent,
+            referer = referer,
+            extraHeaders = extraHeaders,
+            rangeHeader = "bytes=$requestStart-${task.endByte}"
+        )
 
         val okClient = if (session.isAudio) BtrHttpClient.chunkAudioClient else BtrHttpClient.chunkClient
         val call = okClient.newCall(request)
@@ -3576,7 +3751,8 @@ object BtrChunkEngine {
         url: String,
         session: BtrMediaSession,
         userAgent: String,
-        referer: String,
+        referer: String?,
+        extraHeaders: Map<String, String> = emptyMap(),
         statsTracker: StreamStatsTracker,
         concurrencyController: DynamicConcurrencyController? = null,
         streamCallKey: String? = null,
@@ -3585,12 +3761,13 @@ object BtrChunkEngine {
     ) {
         val host = extractHostname(url)
         val startTime = System.currentTimeMillis()
-        val request = Request.Builder()
-            .url(url)
-            .header("Range", "bytes=${task.startByte}-${task.endByte}")
-            .header("Referer", referer)
-            .header("User-Agent", userAgent)
-            .build()
+        val request = buildUpstreamRequest(
+            url = url,
+            userAgent = userAgent,
+            referer = referer,
+            extraHeaders = extraHeaders,
+            rangeHeader = "bytes=${task.startByte}-${task.endByte}"
+        )
 
         val okClient = if (session.isAudio) BtrHttpClient.audioClient else BtrHttpClient.fallbackClient
         val call = okClient.newCall(request)

@@ -127,6 +127,8 @@ object PlayerHook {
     private val builderCleanLiveUrls = IdentityWeakMap<List<String>>()
     private val builderBtrUrl = IdentityWeakMap<String>()
     private val builderRequestHeaders = IdentityWeakMap<MutableMap<String, String>>()
+    private val playerRequestHeaders = IdentityWeakMap<MutableMap<String, String>>()
+    private val playerAllSessionIds = IdentityWeakMap<MutableSet<String>>()
     private val builderAutoVod = IdentityWeakMap<AutoVodBinding>()
     private val builderInflightHandle = IdentityWeakMap<AutoVodRouter.InflightRequestHandle>()
     private val segmentToSessionId = IdentityWeakMap<String>()
@@ -215,7 +217,140 @@ object PlayerHook {
         btrConfigEnabled: Boolean
     ): List<String> {
         if (!btrConfigEnabled) return distinctFiltered
-        return if (!btrUrl.isNullOrBlank()) listOf(btrUrl) else emptyList()
+        if (btrUrl.isNullOrBlank()) return emptyList()
+        // 将 1~2 个安全直连源置于 btrUrl 之后作为原生播放器级最终灾备：正常走 btrUrl，全节点 403 无法恢复时自动回退原生直连
+        val safeFallbacks = distinctFiltered
+            .asSequence()
+            .map { it.trim() }
+            .filter { cand ->
+                if (cand.isBlank() || cand == btrUrl) return@filter false
+                val parsed = BiliAcceleratorCore.parseUri(cand)
+                val host = BiliAcceleratorCore.normalizeHost(parsed?.host)
+                if (BiliAcceleratorCore.isLoopbackHost(host) ||
+                    cand.contains("127.0.0.1:") ||
+                    cand.contains("localhost:")
+                ) {
+                    return@filter false
+                }
+                if (!BiliAcceleratorCore.isAkamaiHost(host) && cand.contains("hdnts=", ignoreCase = true)) {
+                    return@filter false
+                }
+                true
+            }
+            .distinct()
+            .take(2)
+            .toList()
+        return listOf(btrUrl) + safeFallbacks
+    }
+
+    private fun unwrapRawCandidatesForBtr(rawUrls: List<String>): List<String> {
+        if (rawUrls.isEmpty()) return emptyList()
+        return rawUrls
+            .asSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .map { u ->
+                val step1 = BiliAcceleratorCore.unwrapSmtcdnsUrl(u).ifBlank { u }
+                BiliAcceleratorCore.extractSchedulerSourceUrl(step1) ?: step1
+            }
+            .distinct()
+            .toList()
+    }
+
+    internal fun recordPlayerOptionHeader(
+        player: Any?,
+        optionName: String?,
+        optionValue: String?
+    ) {
+        if (player == null || optionName.isNullOrBlank() || optionValue.isNullOrBlank()) return
+        val nameLower = optionName.trim().lowercase()
+        val value = optionValue.trim()
+        if (value.isEmpty()) return
+
+        val captured = LinkedHashMap<String, String>()
+        when (nameLower) {
+            "user_agent", "user-agent" -> {
+                if (io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isUsableClientUserAgent(value)) {
+                    captured["User-Agent"] = value
+                }
+            }
+            "referer" -> {
+                if (io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isAllowedReferer(value)) {
+                    captured["Referer"] = value
+                }
+            }
+            "headers" -> {
+                for (rawLine in value.split('\n')) {
+                    val line = rawLine.trim().trimEnd('\r')
+                    if (line.isEmpty()) continue
+                    val colon = line.indexOf(':')
+                    if (colon <= 0) continue
+                    val k = line.substring(0, colon).trim()
+                    val v = line.substring(colon + 1).trim()
+                    if (k.isEmpty() || v.isEmpty()) continue
+                    when {
+                        k.equals("user-agent", ignoreCase = true) -> {
+                            if (io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isUsableClientUserAgent(v)) {
+                                captured["User-Agent"] = v
+                            }
+                        }
+                        k.equals("referer", ignoreCase = true) -> {
+                            if (io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.isAllowedReferer(v)) {
+                                captured["Referer"] = v
+                            }
+                        }
+                        else -> captured[k] = v
+                    }
+                }
+            }
+            else -> return
+        }
+        if (captured.isEmpty()) return
+
+        val store = playerRequestHeaders[player]
+            ?: Collections.synchronizedMap(LinkedHashMap<String, String>()).also { playerRequestHeaders[player] = it }
+        synchronized(store) {
+            store.putAll(captured)
+        }
+
+        val boundSessions = LinkedHashSet<String>()
+        playerToSessionId[player]?.let { boundSessions.add(it) }
+        BtrSessionManager.getSessionForBuilder(player)?.let { boundSessions.add(it) }
+        playerAllSessionIds[player]?.let { set ->
+            synchronized(set) { boundSessions.addAll(set) }
+        }
+        for (sid in boundSessions) {
+            syncHeaderMapToSession(captured, sid)
+        }
+    }
+
+    private fun syncHeaderMapToSession(headers: Map<*, *>?, sessionId: String) {
+        if (headers.isNullOrEmpty() || sessionId.isBlank()) return
+        var ua: String? = null
+        var ref: String? = null
+        val extras = LinkedHashMap<String, String>()
+        for ((k, v) in headers) {
+            val ks = k?.toString()?.trim()?.takeIf { it.isNotEmpty() } ?: continue
+            val vs = v?.toString()?.trim()?.takeIf { it.isNotEmpty() } ?: continue
+            when {
+                ks.equals("user-agent", ignoreCase = true) -> ua = vs
+                ks.equals("referer", ignoreCase = true) -> ref = vs
+                else -> extras[ks] = vs
+            }
+        }
+        BtrSessionManager.applyClientHeaders(
+            sessionId = sessionId,
+            userAgent = ua,
+            referer = ref,
+            extraHeaders = extras
+        )
+    }
+
+    private fun syncPlayerHeadersToSession(player: Any?, sessionId: String) {
+        if (player == null || sessionId.isBlank()) return
+        val store = playerRequestHeaders[player] ?: return
+        val snapshot = synchronized(store) { LinkedHashMap(store) }
+        syncHeaderMapToSession(snapshot, sessionId)
     }
 
     private fun convertBackupsForParamType(paramType: Class<*>, backups: List<String>): Any {
@@ -274,7 +409,8 @@ object PlayerHook {
         val wasConvergedToBtr = builderNativeConvergedToBtr.remove(builder) == true
         if (!btrUrl.isNullOrBlank()) {
             if (deferredMethod != null || pendingBackups != null) {
-                if (applyBuilderBackupUrls(builder, listOf(btrUrl), fallbackMethod)) {
+                val nativeBackups = computeNativeBackupsForSession(btrUrl, pendingBackups.orEmpty(), btrConfigEnabled = true)
+                if (applyBuilderBackupUrls(builder, nativeBackups, fallbackMethod)) {
                     builderNativeConvergedToBtr[builder] = true
                 }
             }
@@ -404,10 +540,11 @@ object PlayerHook {
 
         val distinctRaw = rawList.distinct()
         val effectiveConfig = AutoVodRouter.effectiveRewriteConfig(config)
+        val nativeSafeConfig = if (effectiveConfig.enableBtr) effectiveConfig.copy(enableBtr = false) else effectiveConfig
         val filteredList = if (
-            effectiveConfig.blockPcdn || effectiveConfig.proxyMcdn || effectiveConfig.forceUpos || (effectiveConfig.rewriteAkamai && effectiveConfig.enableBtr)
+            nativeSafeConfig.blockPcdn || nativeSafeConfig.proxyMcdn || nativeSafeConfig.forceUpos
         ) {
-            filterAndFillBackupUrls(rawList, effectiveConfig, onRewrite)
+            filterAndFillBackupUrls(rawList, nativeSafeConfig, onRewrite)
         } else {
             distinctRaw
         }
@@ -444,8 +581,10 @@ object PlayerHook {
         }
         val btrConfigActive = config.enableBtr
         if (btrConfigActive) {
+            // BTR 会话接收原始（仅做 smtcdns/xy_usource 解包）候选，禁止将 filterAndFillBackupUrls 提前换壳的伪 UPOS 投毒到 BTR 候选池
+            val rawForBtr = unwrapRawCandidatesForBtr(distinctRaw)
             if (boundSessionId != null) {
-                BtrSessionManager.updateBackups(boundSessionId, distinctFiltered)
+                BtrSessionManager.updateBackups(boundSessionId, rawForBtr)
                 val btrUrl = builderBtrUrl[builder]
                 val nativeBackups = computeNativeBackupsForSession(btrUrl, distinctFiltered, true)
                 builderDeferredBackupMethod.remove(builder)
@@ -468,7 +607,7 @@ object PlayerHook {
                     proceedWithArg(convertBackupsForParamType(method.parameterTypes[0], emptyList()))
                 }
             } else if (builder == null) {
-                BtrSessionManager.updateBackupsByCandidateUrls(distinctFiltered)
+                BtrSessionManager.updateBackupsByCandidateUrls(rawForBtr)
             }
         }
 
@@ -830,7 +969,8 @@ object PlayerHook {
         }
 
         val rawBackups = builderInstance?.let { builderRawBackups[it] }.orEmpty()
-        val pendingBackups = builderInstance?.let { builderPendingBackups[it] }.orEmpty().toMutableList()
+        // BTR 内部始终基于原始（仅做 smtcdns / xy_usource 解包）候选构建节点池，避免提前把 PCDN 换壳成伪 UPOS 投毒合成池
+        val pendingBackups = unwrapRawCandidatesForBtr(rawBackups).toMutableList()
         val nowSec = System.currentTimeMillis() / 1000L
         val origDeadlineSec = BiliAcceleratorCore.extractUrlDeadlineSeconds(originalUrl)
         val isPlayinfoUrlsFresh = playinfoTrack != null && (
@@ -840,12 +980,8 @@ object PlayerHook {
             )
 
         if (isPlayinfoUrlsFresh && playinfoTrack.backupUrls.isNotEmpty()) {
-            val filteredPlayinfoBackups = if (config.blockPcdn || config.proxyMcdn || config.forceUpos || (config.rewriteAkamai && config.enableBtr)) {
-                filterAndFillBackupUrls(playinfoTrack.backupUrls, config, null)
-            } else {
-                playinfoTrack.backupUrls
-            }
-            for (b in filteredPlayinfoBackups) {
+            val unwrappedPlayinfoBackups = unwrapRawCandidatesForBtr(playinfoTrack.backupUrls)
+            for (b in unwrappedPlayinfoBackups) {
                 if (b.isNotBlank() && b != originalUrl && !pendingBackups.contains(b)) {
                     pendingBackups.add(b)
                 }
@@ -884,12 +1020,21 @@ object PlayerHook {
             effectiveResult = result
         }
 
-        // 对齐 BTR / realzza：BTR 模式下发生域名改写（Akamai/force-upos/或无干净 UPOS 时的 PCDN/MCDN/解包）时，
-        // 保留原始地址置于末尾作为 403 兜底，避免改写后的 UPOS 节点拒绝边缘签名导致无源可退
+        val unwrappedOriginal = BiliAcceleratorCore.unwrapSmtcdnsUrl(originalUrl).ifBlank { originalUrl }
+            .let { BiliAcceleratorCore.extractSchedulerSourceUrl(it) ?: it }
+        val isPrimaryRewrittenFromUntrusted = cleanOfficialBackup == null &&
+            !isLive &&
+            targetUrl != originalUrl &&
+            result.reason != "akamai-redirect" &&
+            !BiliAcceleratorCore.isCleanUposDonor(unwrappedOriginal, requireUpgcxcode = true)
+
+        // 对齐 BTR / realzza：BTR 模式下发生域名改写（Akamai/force-upos/edge-bound 提权/或无干净 UPOS 时的 PCDN/MCDN/解包）时，
+        // 保留原始地址置于末尾作为 403 兜底，避免改写/提权后的 UPOS 节点拒绝签名导致无源可退
         val shouldKeepOriginalFallback = !isLive && originalUrl != targetUrl && (
             result.reason == "akamai-redirect" ||
                 BiliAcceleratorCore.isAkamaiHost(result.originalHost) ||
                 result.reason == "force-upos" ||
+                BiliAcceleratorCore.isEdgeBoundSignatureUrl(originalUrl) ||
                 (result.changed && cleanOfficialBackup == null)
             )
         if (shouldKeepOriginalFallback && !pendingBackups.contains(originalUrl)) {
@@ -918,8 +1063,20 @@ object PlayerHook {
             }
         }
 
-        val headerUa = requestHeaders?.entries?.firstOrNull { it.key?.toString()?.equals("user-agent", ignoreCase = true) == true }?.value?.toString()
-        val headerRef = requestHeaders?.entries?.firstOrNull { it.key?.toString()?.equals("referer", ignoreCase = true) == true }?.value?.toString()
+        var headerUa: String? = null
+        var headerRef: String? = null
+        val extraReqHeaders = LinkedHashMap<String, String>()
+        if (requestHeaders != null) {
+            for ((k, v) in requestHeaders) {
+                val ks = k?.toString()?.trim()?.takeIf { it.isNotEmpty() } ?: continue
+                val vs = v?.toString()?.trim()?.takeIf { it.isNotEmpty() } ?: continue
+                when {
+                    ks.equals("user-agent", ignoreCase = true) -> headerUa = vs
+                    ks.equals("referer", ignoreCase = true) -> headerRef = vs
+                    else -> extraReqHeaders[ks] = vs
+                }
+            }
+        }
         val isAudio = !isLive && (playinfoTrack?.isAudio == true || BiliAcceleratorCore.isAudioTrack(targetUrl))
 
         val proxyPort = io.github.jh_mmm.biliaccelerator.btr.BtrLocalProxyServer.port
@@ -933,8 +1090,12 @@ object PlayerHook {
                 if (pendingBackups.isNotEmpty()) {
                     BtrSessionManager.updateBackups(existingSession.sessionId, pendingBackups)
                 }
-                if (!headerUa.isNullOrBlank()) existingSession.userAgent = headerUa
-                if (!headerRef.isNullOrBlank()) existingSession.referer = headerRef
+                BtrSessionManager.applyClientHeaders(
+                    sessionId = existingSession.sessionId,
+                    userAgent = headerUa,
+                    referer = headerRef,
+                    extraHeaders = extraReqHeaders
+                )
                 val reusedUrl = "http://127.0.0.1:$proxyPort/stream/${existingSession.sessionId}.$ext"
                 builderResolvedNonBtr.remove(builderInstance)
                 playerResolvedNonBtr.remove(builderInstance)
@@ -959,11 +1120,12 @@ object PlayerHook {
             isAudio = isAudio,
             isEpisode = isEpisode,
             isLive = isLive,
-            config = config
+            config = config,
+            referer = headerRef,
+            extraHeaders = extraReqHeaders,
+            rawPrimaryUrl = originalUrl,
+            primaryRewrittenFromUntrusted = isPrimaryRewrittenFromUntrusted
         )
-        if (!headerRef.isNullOrBlank()) {
-            BtrSessionManager.get(sessionId)?.referer = headerRef
-        }
         val btrUrl = "http://127.0.0.1:$proxyPort/stream/$sessionId.$ext"
         if (builderInstance != null) {
             builderResolvedNonBtr.remove(builderInstance)
@@ -1172,6 +1334,7 @@ object PlayerHook {
         val shouldPromote = result.isPcdn ||
             result.isMcdn ||
             BiliAcceleratorCore.isRelayUrl(originalUrl) ||
+            BiliAcceleratorCore.isEdgeBoundSignatureUrl(originalUrl) ||
             result.reason == "akamai-redirect"
         if (!shouldPromote) return null
         val nowSec = System.currentTimeMillis() / 1000L
@@ -1239,7 +1402,19 @@ object PlayerHook {
             playerInstance?.let { playerResolvedNonBtr[it] = true }
             return null
         }
-        val btrOutcome = tryRewriteToBtr(original, result, config, playerInstance, headersMap)
+        val mergedPlayerHeaders = LinkedHashMap<String, String>()
+        playerInstance?.let { playerRequestHeaders[it] }?.let { store ->
+            synchronized(store) { mergedPlayerHeaders.putAll(store) }
+        }
+        if (headersMap != null) {
+            for ((k, v) in headersMap) {
+                val ks = k?.toString()?.trim()?.takeIf { it.isNotEmpty() } ?: continue
+                val vs = v?.toString()?.trim()?.takeIf { it.isNotEmpty() } ?: continue
+                mergedPlayerHeaders[ks] = vs
+            }
+        }
+        val effectiveHeaders = mergedPlayerHeaders.takeIf { it.isNotEmpty() } ?: headersMap
+        val btrOutcome = tryRewriteToBtr(original, result, config, playerInstance, effectiveHeaders)
         if (btrOutcome != null) {
             if (btrOutcome.effectiveResult.changed && shouldReportResult(btrOutcome.effectiveResult)) {
                 onRewrite?.invoke(btrOutcome.effectiveResult)
@@ -1377,27 +1552,27 @@ object PlayerHook {
                 out.videoBuilder = node
             }
         }
-        if (out.videoSessionId != null) return
+        if (out.videoSessionId != null && out.audioSessionId != null) return
 
         when (node) {
             is Iterable<*> -> {
                 for (item in node) {
                     scanObjectForBindings(item, depth + 1, maxDepth, visited, out)
-                    if (out.videoSessionId != null) return
+                    if (out.videoSessionId != null && out.audioSessionId != null) return
                 }
                 return
             }
             is Array<*> -> {
                 for (item in node) {
                     scanObjectForBindings(item, depth + 1, maxDepth, visited, out)
-                    if (out.videoSessionId != null) return
+                    if (out.videoSessionId != null && out.audioSessionId != null) return
                 }
                 return
             }
             is Map<*, *> -> {
                 for (v in node.values) {
                     scanObjectForBindings(v, depth + 1, maxDepth, visited, out)
-                    if (out.videoSessionId != null) return
+                    if (out.videoSessionId != null && out.audioSessionId != null) return
                 }
                 return
             }
@@ -1423,7 +1598,7 @@ object PlayerHook {
                     f.get(node)
                 }.getOrNull() ?: continue
                 scanObjectForBindings(v, depth + 1, maxDepth, visited, out)
-                if (out.videoSessionId != null) return
+                if (out.videoSessionId != null && out.audioSessionId != null) return
             }
             cls = cls.superclass
             superDepth++
@@ -1439,6 +1614,14 @@ object PlayerHook {
         if (!bestSid.isNullOrBlank()) {
             playerToSessionId[player] = bestSid
             BtrSessionManager.bindBuilderSession(player, bestSid)
+            val allSids = playerAllSessionIds[player]
+                ?: Collections.synchronizedSet(LinkedHashSet<String>()).also { playerAllSessionIds[player] = it }
+            synchronized(allSids) {
+                discovered.videoSessionId?.let { allSids.add(it) }
+                discovered.audioSessionId?.let { allSids.add(it) }
+            }
+            discovered.videoSessionId?.let { syncPlayerHeadersToSession(player, it) }
+            discovered.audioSessionId?.let { syncPlayerHeadersToSession(player, it) }
             playerResolvedNonBtr.remove(player)
             playerToAutoVod.remove(player)
             return
@@ -1704,6 +1887,8 @@ object PlayerHook {
             }
         }
         playerToSessionId.remove(player)
+        playerAllSessionIds.remove(player)
+        playerRequestHeaders.remove(player)
         playerToAutoVod.remove(player)
         playerResolvedNonBtr.remove(player)
         BtrSessionManager.unbindBuilderSession(player)
@@ -1791,7 +1976,30 @@ object PlayerHook {
                 } catch (_: Throwable) {}
             }
 
-            // 2.6 Hook reset/release/stop：释放播放器绑定并中止在途统计与卡顿计时器
+            // 2.6 Hook setOption(category, name, value)：捕获 IjkMediaPlayer 真实配置的 user_agent 与 headers，避免 BTR 丢失客户端特征头导致 403
+            val setOptionMethods = allMethods.filter { m ->
+                m.name == "setOption" &&
+                    m.parameterTypes.size == 3 &&
+                    m.parameterTypes[1] == String::class.java &&
+                    m.parameterTypes[2] == String::class.java
+            }
+            for (m in setOptionMethods) {
+                if (!synchronized(hookedMethods) { hookedMethods.add(m) }) continue
+                try {
+                    module.hook(m).intercept { chain ->
+                        runCatching {
+                            recordPlayerOptionHeader(
+                                player = chain.thisObject,
+                                optionName = chain.args.getOrNull(1) as? String,
+                                optionValue = chain.args.getOrNull(2) as? String
+                            )
+                        }
+                        chain.proceed()
+                    }
+                } catch (_: Throwable) {}
+            }
+
+            // 2.7 Hook reset/release/stop：释放播放器绑定并中止在途统计与卡顿计时器
             val resetMethods = allMethods.filter {
                 (it.name == "reset" || it.name == "release" || it.name == "stop") && it.parameterTypes.isEmpty()
             }

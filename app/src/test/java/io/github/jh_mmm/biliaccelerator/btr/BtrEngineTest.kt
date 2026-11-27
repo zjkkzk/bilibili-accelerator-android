@@ -8,10 +8,12 @@ import io.github.jh_mmm.biliaccelerator.core.StatsManager
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayOutputStream
 import java.net.ServerSocket
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 class BtrEngineTest {
@@ -2499,6 +2501,192 @@ class BtrEngineTest {
             runCatching { backup404Server.close() }
             tPrimary.interrupt()
             tBackup404.interrupt()
+        }
+    }
+
+    @Test
+    fun testHeaderFilteringAndAppPlatformOmitsRefererUpstream() {
+        // 1. Bad player-default UAs must be rejected, valid BiliDroid / MarkII UAs accepted
+        for (badUa in listOf("Lavf/58.76.100", "stagefright/1.2", "ijkplayer", "Dalvik/2.1.0", "Java/17.0.1", "okhttp/4.12.0", "")) {
+            assertFalse("Bad default UA must be rejected: $badUa", BtrLocalProxyServer.isUsableClientUserAgent(badUa))
+        }
+        assertTrue(BtrLocalProxyServer.isUsableClientUserAgent("Mozilla/5.0 BiliDroid/8.24.0 (bbcallen@gmail.com) os/android"))
+        assertTrue(BtrLocalProxyServer.isUsableClientUserAgent("Bilibili Freedoooooom/MarkII"))
+
+        // 2. Extra header filtering preserves safe app headers and strips hop-by-hop / range headers
+        val extra = BtrLocalProxyServer.extractForwardableExtraHeaders(
+            rawHeaders = mapOf(
+                "host" to "127.0.0.1:18080",
+                "range" to "bytes=0-100",
+                "connection" to "keep-alive",
+                "accept-encoding" to "gzip",
+                "icy-metadata" to "1",
+                "user-agent" to "Lavf/58.76.100",
+                "x-bili-trace-id" to "trace-999",
+                "origin" to "https://www.bilibili.com"
+            ),
+            sessionExtraHeaders = mapOf("X-Session-Only" to "yes")
+        )
+        assertEquals("trace-999", extra["x-bili-trace-id"])
+        assertEquals("https://www.bilibili.com", extra["origin"])
+        assertEquals("yes", extra["X-Session-Only"])
+        assertFalse(extra.keys.any { it.equals("host", true) || it.equals("range", true) || it.equals("icy-metadata", true) || it.equals("accept-encoding", true) })
+
+        // 3. End-to-end: platform=android session omits Referer upstream, replaces Lavf UA, forwards X-Bili-Trace-Id
+        val payload = ByteArray(16 * 1024) { (it and 0xFF).toByte() }
+        val receivedHeaders = java.util.concurrent.ConcurrentHashMap<String, String>()
+        val upstream = ServerSocket(0, 8, java.net.InetAddress.getByName("127.0.0.1"))
+        val tUpstream = Thread {
+            while (!upstream.isClosed) {
+                val sock = try { upstream.accept() } catch (_: Throwable) { break }
+                Thread {
+                    sock.use { s ->
+                        val reader = s.getInputStream().bufferedReader()
+                        reader.readLine() ?: return@use
+                        var rangeHdr = ""
+                        while (true) {
+                            val line = reader.readLine() ?: break
+                            if (line.isEmpty()) break
+                            val idx = line.indexOf(':')
+                            if (idx > 0) {
+                                val k = line.substring(0, idx).trim().lowercase()
+                                val v = line.substring(idx + 1).trim()
+                                receivedHeaders[k] = v
+                                if (k == "range") rangeHdr = v
+                            }
+                        }
+                        val parts = rangeHdr.removePrefix("bytes=").split("-")
+                        val start = parts.getOrNull(0)?.toIntOrNull() ?: 0
+                        val end = minOf(parts.getOrNull(1)?.toIntOrNull() ?: (payload.size - 1), payload.size - 1)
+                        val len = (end - start + 1).coerceAtLeast(0)
+                        val out = s.getOutputStream()
+                        out.write("HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nContent-Range: bytes $start-$end/${payload.size}\r\nContent-Length: $len\r\nConnection: close\r\n\r\n".toByteArray())
+                        out.write(payload, start, len)
+                        out.flush()
+                    }
+                }.apply { isDaemon = true; start() }
+            }
+        }.apply { isDaemon = true; start() }
+
+        var sid = ""
+        try {
+            BtrLocalProxyServer.start()
+            val port = BtrLocalProxyServer.port
+            val nowSec = System.currentTimeMillis() / 1000L
+            val androidUrl = "http://127.0.0.1:${upstream.localPort}/upgcxcode/12/34/app_stream.m4s?platform=android&deadline=${nowSec + 3600}"
+            sid = BtrSessionManager.register(primaryUrl = androidUrl)
+            assertNull("platform=android stream must default to null referer", BtrSessionManager.get(sid)!!.referer)
+
+            val conn = java.net.URL("http://127.0.0.1:$port/stream/$sid/v.m4s").openConnection() as java.net.HttpURLConnection
+            conn.setRequestProperty("User-Agent", "Lavf/58.76.100")
+            conn.setRequestProperty("X-Bili-Trace-Id", "abc-123")
+            conn.setRequestProperty("Range", "bytes=0-1023")
+            assertEquals(206, conn.responseCode)
+            assertEquals(1024, conn.inputStream.use { it.readBytes() }.size)
+
+            assertFalse("Lavf UA must never be forwarded upstream", (receivedHeaders["user-agent"] ?: "").contains("Lavf", ignoreCase = true))
+            assertEquals(BtrChunkEngine.FALLBACK_PLAYER_USER_AGENT, receivedHeaders["user-agent"])
+            assertNull("Referer must be omitted upstream for platform=android streams", receivedHeaders["referer"])
+            assertEquals("abc-123", receivedHeaders["x-bili-trace-id"])
+        } finally {
+            if (sid.isNotBlank()) BtrSessionManager.remove(sid)
+            runCatching { upstream.close() }
+            tUpstream.interrupt()
+        }
+    }
+
+    @Test
+    fun testProbe403HeaderCompatRecoveryLatchesHeadersAndClearsTransientBans() {
+        val payload = ByteArray(140_000) { ((it * 31 + 7) and 0xFF).toByte() }
+        val requireNoReferer = AtomicBoolean(true)
+
+        fun startHeaderStrictServer(): ServerSocket {
+            val ss = ServerSocket(0, 16, java.net.InetAddress.getByName("127.0.0.1"))
+            Thread {
+                while (!ss.isClosed) {
+                    val sock = try { ss.accept() } catch (_: Throwable) { break }
+                    Thread {
+                        sock.use { s ->
+                            val reader = s.getInputStream().bufferedReader()
+                            reader.readLine() ?: return@use
+                            var rangeHdr = ""
+                            var refererHdr: String? = null
+                            while (true) {
+                                val line = reader.readLine() ?: break
+                                if (line.isEmpty()) break
+                                val idx = line.indexOf(':')
+                                if (idx > 0) {
+                                    val k = line.substring(0, idx).trim().lowercase()
+                                    val v = line.substring(idx + 1).trim()
+                                    if (k == "range") rangeHdr = v
+                                    if (k == "referer") refererHdr = v
+                                }
+                            }
+                            val out = s.getOutputStream()
+                            val allowed = if (requireNoReferer.get()) refererHdr.isNullOrBlank() else !refererHdr.isNullOrBlank()
+                            if (!allowed) {
+                                out.write("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                                out.flush()
+                                return@use
+                            }
+                            val parts = rangeHdr.removePrefix("bytes=").split("-")
+                            val start = parts.getOrNull(0)?.toIntOrNull() ?: 0
+                            val end = minOf(parts.getOrNull(1)?.toIntOrNull() ?: (payload.size - 1), payload.size - 1)
+                            val len = (end - start + 1).coerceAtLeast(0)
+                            out.write("HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nContent-Range: bytes $start-$end/${payload.size}\r\nContent-Length: $len\r\nConnection: close\r\n\r\n".toByteArray())
+                            out.write(payload, start, len)
+                            out.flush()
+                        }
+                    }.apply { isDaemon = true; start() }
+                }
+            }.apply { isDaemon = true; start() }
+            return ss
+        }
+
+        val primaryServer = startHeaderStrictServer()
+        val peerServer = startHeaderStrictServer()
+        var sidA = ""
+        var sidB = ""
+        try {
+            BtrLocalProxyServer.start()
+            val port = BtrLocalProxyServer.port
+            val nowSec = System.currentTimeMillis() / 1000L
+
+            // Scenario A: initial Referer causes 403 on all nodes -> retries without Referer -> recovers, latches null Referer, clears peer bans
+            requireNoReferer.set(true)
+            val urlA1 = "http://127.0.0.1:${primaryServer.localPort}/upgcxcode/99/11/header_recover_a.m4s?deadline=${nowSec + 3600}"
+            val urlA2 = "http://localhost:${peerServer.localPort}/upgcxcode/99/11/header_recover_a.m4s?deadline=${nowSec + 3600}"
+            sidA = BtrSessionManager.register(primaryUrl = urlA1, backupUrls = listOf(urlA2), referer = "https://www.bilibili.com/")
+            val sessionA = BtrSessionManager.get(sidA)!!
+
+            val connA = java.net.URL("http://127.0.0.1:$port/stream/$sidA/v.m4s").openConnection() as java.net.HttpURLConnection
+            connA.setRequestProperty("Range", "bytes=0-${payload.size - 1}")
+            assertEquals(206, connA.responseCode)
+            val dataA = connA.inputStream.use { it.readBytes() }
+            assertTrue("Scenario A payload must match exactly after 403 header recovery", payload.contentEquals(dataA))
+            assertNull("Recovered null Referer must be latched onto session", sessionA.referer)
+            assertFalse("Transient 403 ban on peer node must be cleared after recovery", sessionA.banList.isBanned(urlA2, "localhost"))
+
+            // Scenario B: platform=android (null Referer) gets 403 -> retries with Referer -> recovers and latches Referer
+            requireNoReferer.set(false)
+            val urlB1 = "http://127.0.0.1:${primaryServer.localPort}/upgcxcode/99/11/header_recover_b.m4s?platform=android&deadline=${nowSec + 3600}"
+            val urlB2 = "http://localhost:${peerServer.localPort}/upgcxcode/99/11/header_recover_b.m4s?platform=android&deadline=${nowSec + 3600}"
+            sidB = BtrSessionManager.register(primaryUrl = urlB1, backupUrls = listOf(urlB2))
+            val sessionB = BtrSessionManager.get(sidB)!!
+            assertNull(sessionB.referer)
+
+            val connB = java.net.URL("http://127.0.0.1:$port/stream/$sidB/v.m4s").openConnection() as java.net.HttpURLConnection
+            connB.setRequestProperty("Range", "bytes=0-${payload.size - 1}")
+            assertEquals(206, connB.responseCode)
+            val dataB = connB.inputStream.use { it.readBytes() }
+            assertTrue("Scenario B payload must match exactly after 403 Referer recovery", payload.contentEquals(dataB))
+            assertEquals("https://www.bilibili.com/", sessionB.referer)
+            assertFalse("Transient 403 ban on peer node must be cleared after recovery", sessionB.banList.isBanned(urlB2, "localhost"))
+        } finally {
+            if (sidA.isNotBlank()) BtrSessionManager.remove(sidA)
+            if (sidB.isNotBlank()) BtrSessionManager.remove(sidB)
+            runCatching { primaryServer.close() }
+            runCatching { peerServer.close() }
         }
     }
 }

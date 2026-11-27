@@ -209,6 +209,19 @@ class SessionBanList {
     }
 
     fun isHostKnownGood(host: String): Boolean = goodHosts.contains(host)
+
+    /**
+     * 清除由错误请求头（如 UA/Referer 失配）或旧伪装主源引发的瞬时 4xx 拒绝记录，
+     * 避免切换到兼容请求头或提权官方源后仍被旧 403 记录封禁健康节点。
+     */
+    fun clearTransient4xxRefusals() {
+        urlBlockedUntil.clear()
+        urlFailures.clear()
+        synchronized(judgeLock) {
+            emptyReplies.entries.removeIf { it.key.endsWith("\nrefused") }
+            judgeLocked()
+        }
+    }
 }
 
 data class BtrMediaSession(
@@ -216,7 +229,7 @@ data class BtrMediaSession(
     @Volatile var primaryUrl: String,
     @Volatile var backupUrls: List<String>,
     @Volatile var userAgent: String?,
-    @Volatile var referer: String = "https://www.bilibili.com/",
+    @Volatile var referer: String? = "https://www.bilibili.com/",
     val isAudio: Boolean = false,
     val isEpisode: Boolean = false,
     val isLive: Boolean = false,
@@ -246,7 +259,10 @@ data class BtrMediaSession(
     @Volatile var liveCustomPoolOnly: Boolean = false,
     val activeStreamSeq: AtomicLong = AtomicLong(0L),
     val lastAbortedSeekHint: AtomicBoolean = AtomicBoolean(false),
-    val lastObservedStart: AtomicLong = AtomicLong(-1L)
+    val lastObservedStart: AtomicLong = AtomicLong(-1L),
+    @Volatile var extraHeaders: Map<String, String> = emptyMap(),
+    @Volatile var rawPrimaryUrl: String? = null,
+    @Volatile var primaryIsRewrittenFromUntrusted: Boolean = false
 ) {
     fun currentCandidateUrls(): List<String> = synchronized(urlLock) {
         (listOf(primaryUrl) + backupUrls).distinct()
@@ -290,6 +306,39 @@ object BtrSessionManager {
     @Volatile
     private var latestSessionId: String? = null
 
+    fun defaultWebRefererFor(isEpisode: Boolean, isLive: Boolean): String {
+        return when {
+            isEpisode -> "https://www.bilibili.com/bangumi/play/"
+            isLive -> "https://live.bilibili.com/"
+            else -> "https://www.bilibili.com/"
+        }
+    }
+
+    fun applyClientHeaders(
+        sessionId: String,
+        userAgent: String? = null,
+        referer: String? = null,
+        extraHeaders: Map<String, String> = emptyMap()
+    ) {
+        val session = sessions[sessionId] ?: return
+        synchronized(session.urlLock) {
+            val cleanUa = userAgent?.trim()?.takeIf { BtrLocalProxyServer.isUsableClientUserAgent(it) }
+            if (!cleanUa.isNullOrBlank()) {
+                session.userAgent = cleanUa
+            }
+            val cleanRef = referer?.trim()?.takeIf { BtrLocalProxyServer.isAllowedReferer(it) }
+            if (!cleanRef.isNullOrBlank()) {
+                session.referer = cleanRef
+            }
+            if (extraHeaders.isNotEmpty()) {
+                val merged = BtrLocalProxyServer.extractForwardableExtraHeaders(extraHeaders, session.extraHeaders)
+                if (merged.isNotEmpty()) {
+                    session.extraHeaders = merged
+                }
+            }
+        }
+    }
+
     fun register(
         primaryUrl: String,
         backupUrls: List<String> = emptyList(),
@@ -297,19 +346,27 @@ object BtrSessionManager {
         isAudio: Boolean = false,
         isEpisode: Boolean = false,
         isLive: Boolean = false,
-        config: AcceleratorConfig? = null
+        config: AcceleratorConfig? = null,
+        referer: String? = null,
+        extraHeaders: Map<String, String> = emptyMap(),
+        rawPrimaryUrl: String? = null,
+        primaryRewrittenFromUntrusted: Boolean = false
     ): String {
         cleanupStaleSessions()
         val id = UUID.randomUUID().toString().replace("-", "").take(12)
         val validBackups = backupUrls.filter { it.isNotBlank() && it != primaryUrl }.distinct()
         val isPrimaryRelay = BiliAcceleratorCore.isRelayUrl(primaryUrl)
+        val sanitizedUserAgent = userAgent?.trim()?.takeIf { BtrLocalProxyServer.isUsableClientUserAgent(it) }
+        val sanitizedExtraHeaders = BtrLocalProxyServer.extractForwardableExtraHeaders(extraHeaders)
 
-        val referer = if (isEpisode) {
-            "https://www.bilibili.com/bangumi/play/"
-        } else if (isLive) {
-            "https://live.bilibili.com/"
-        } else {
-            "https://www.bilibili.com/"
+        // Android App 签名流 (platform=android/android_i/ios 等) 原生不携带 Web Referer，避免强制塞入 www.bilibili.com 触发 CDN 403
+        val resolvedReferer: String? = when {
+            !referer.isNullOrBlank() && BtrLocalProxyServer.isAllowedReferer(referer) -> referer.trim()
+            isLive -> "https://live.bilibili.com/"
+            BiliAcceleratorCore.isAppPlatformUrl(primaryUrl) ||
+                (!rawPrimaryUrl.isNullOrBlank() && BiliAcceleratorCore.isAppPlatformUrl(rawPrimaryUrl)) -> null
+            isEpisode -> "https://www.bilibili.com/bangumi/play/"
+            else -> "https://www.bilibili.com/"
         }
 
         val cleanPrimaryLiveUrl = if (isLive) BtrLiveCore.unwrapProxyUrl(primaryUrl).ifBlank { primaryUrl } else primaryUrl
@@ -356,6 +413,8 @@ object BtrSessionManager {
 
         // 若宿主未传入完整多源池，合成兼容的跨区 UPOS 镜像池（对齐 realzza V5 与 BTR cdn-resolver.js）
         var resolvedPrimaryUrl = cleanPrimaryLiveUrl
+        var effectiveRawPrimary = rawPrimaryUrl?.trim()?.takeIf { it.isNotEmpty() }
+        var effectivePrimaryUntrusted = primaryRewrittenFromUntrusted
         var synthesizedList: List<String> = emptyList()
         val finalBackups = if (isLive) {
             validBackups
@@ -368,13 +427,20 @@ object BtrSessionManager {
             val cleanIsolated = if (isPrimaryRelay) {
                 isolated
             } else {
-                isolated.filter { !isFallbackOrP2pUrl(it) && !isAkamaiSignedUrl(it) }
+                isolated.filter {
+                    !isFallbackOrP2pUrl(it) &&
+                        !isAkamaiSignedUrl(it) &&
+                        !BiliAcceleratorCore.isEdgeBoundSignatureUrl(it)
+                }
             }
             val akamaiOrP2pFallbacks = if (isPrimaryRelay) {
                 emptyList()
             } else {
                 isolated.filter { isAkamaiSignedUrl(it) } +
-                    isolated.filter { isFallbackOrP2pUrl(it) && !isAkamaiSignedUrl(it) }
+                    isolated.filter {
+                        (isFallbackOrP2pUrl(it) || BiliAcceleratorCore.isEdgeBoundSignatureUrl(it)) &&
+                            !isAkamaiSignedUrl(it)
+                    }
             }
             // 非中继会话不主动丢弃原列表中的中继/代理/PCDN备选，而是降级置于末尾作 403 兜底（绝不作为 Donor 合成普通 UPOS）
             val relayFallbacks = if (isPrimaryRelay) {
@@ -384,8 +450,27 @@ object BtrSessionManager {
             }
             val primaryHostLower = hostKeyOf(primaryUrl)
             val isPrimaryBstar = primaryHostLower.endsWith(".bstarstatic.com")
+            val isPrimaryEdgeBound = BiliAcceleratorCore.isEdgeBoundSignatureUrl(primaryUrl)
             val customVodHosts = effectiveCustomVodHosts(config)
             val isCustomMode = customVodHosts.isNotEmpty()
+            val p2pFallbackAddresses = akamaiOrP2pFallbacks
+                .filter { isFallbackOrP2pUrl(it) || BiliAcceleratorCore.isEdgeBoundSignatureUrl(it) }
+                .map { addressKeyOf(it) }
+                .filter { it.isNotBlank() }
+                .toSet()
+            val primaryMatchesP2pFallback = cleanIsolated.isEmpty() &&
+                p2pFallbackAddresses.isNotEmpty() &&
+                addressKeyOf(primaryUrl).let { it.isNotBlank() && it in p2pFallbackAddresses }
+            if (effectiveRawPrimary == null && primaryMatchesP2pFallback) {
+                effectiveRawPrimary = akamaiOrP2pFallbacks.firstOrNull {
+                    (isFallbackOrP2pUrl(it) || BiliAcceleratorCore.isEdgeBoundSignatureUrl(it)) &&
+                        addressKeyOf(it) == addressKeyOf(primaryUrl)
+                }
+            }
+            if (primaryMatchesP2pFallback) {
+                effectivePrimaryUntrusted = true
+            }
+
             val shouldSynthesize = !isPrimaryRelay && !isPrimaryBstar && (
                 isCustomMode || config != null || isolated.none { !isAkamaiSignedUrl(it) }
             )
@@ -400,16 +485,31 @@ object BtrSessionManager {
                     akamaiBackupAddresses.isNotEmpty() &&
                     addressKeyOf(primaryUrl).let { it.isNotBlank() && it in akamaiBackupAddresses }
 
-                val cleanDonorCandidates = if (primaryIsRewrittenAkamai) {
+                // 被提前换壳的 PCDN/边缘主源（effectivePrimaryUntrusted）与边缘强绑定主源严禁充当 cleanDonor 投毒合成池
+                val cleanDonorCandidates = if (primaryIsRewrittenAkamai || effectivePrimaryUntrusted || isPrimaryEdgeBound) {
                     cleanIsolated
                 } else {
                     cleanIsolated + listOf(primaryUrl)
                 }
                 val cleanDonor = cleanDonorCandidates.firstOrNull { isEligibleCleanDonor(it) }
+                // 若主源是换壳 PCDN/边缘源且备选中已存在真实干净官方 UPOS 源（携带独立合法签名），立即提权为真主源
+                val promotedOriginFallback = if (cleanDonor != null &&
+                    (effectivePrimaryUntrusted || isPrimaryEdgeBound) &&
+                    addressKeyOf(cleanDonor) != addressKeyOf(primaryUrl)
+                ) {
+                    val origFallback = if (effectivePrimaryUntrusted) effectiveRawPrimary else primaryUrl
+                    resolvedPrimaryUrl = cleanDonor
+                    effectivePrimaryUntrusted = false
+                    origFallback
+                } else {
+                    null
+                }
+                val extraOriginFallbacks = listOfNotNull(promotedOriginFallback)
+                val activePrimaryHostLower = hostKeyOf(resolvedPrimaryUrl)
                 // 对齐上游 cdn-resolver.js：仅当不存在任何非 Akamai donor 且 rewriteAkamai+BTR 开启时，
                 // 收集全部 Akamai donor 并按 node-first 顺序展开，保留不同签名变体交由 banList 淘汰 403 签名。
                 val akamaiDonors = if (cleanDonor == null && isAkamaiDonorEnabled(config)) {
-                    findAkamaiDonors(isolated, primaryUrl)
+                    findAkamaiDonors(isolated, resolvedPrimaryUrl)
                 } else emptyList()
                 val isAllAkamaiMultiDonor = cleanDonor == null && akamaiDonors.size > 1
 
@@ -419,7 +519,7 @@ object BtrSessionManager {
                         config = config,
                         isEpisode = isEpisode,
                         allowAkamaiDonor = false,
-                        excludeUrl = if (isCustomMode) "" else primaryUrl,
+                        excludeUrl = if (isCustomMode) "" else resolvedPrimaryUrl,
                         excludeDonorHost = !isCustomMode
                     )
                     akamaiDonors.isNotEmpty() -> synthesizeCompatibleBackupsForDonors(
@@ -427,7 +527,7 @@ object BtrSessionManager {
                         config = config,
                         isEpisode = isEpisode,
                         allowAkamaiDonor = true,
-                        excludeUrl = if (isCustomMode) "" else primaryUrl,
+                        excludeUrl = if (isCustomMode) "" else resolvedPrimaryUrl,
                         excludeDonorHost = false
                     )
                     else -> emptyList()
@@ -437,8 +537,13 @@ object BtrSessionManager {
                     // 对齐上游 cdn-resolver.js custom 模式：仅使用用户自定义 CDN 池内的节点，
                     // 仅当合成结果为零且原始列表中也没有自定义节点时才回退至原始地址。
                     val customHostSet = customVodHosts.toSet()
-                    val allowedOriginals = (listOf(primaryUrl) + validBackups)
-                        .filter { it.isNotBlank() && !BiliAcceleratorCore.isRelayUrl(it) && isHostInCustomSet(it, customHostSet) }
+                    val allowedOriginals = (listOf(resolvedPrimaryUrl) + validBackups)
+                        .filter {
+                            it.isNotBlank() &&
+                                !BiliAcceleratorCore.isRelayUrl(it) &&
+                                !BiliAcceleratorCore.isEdgeBoundSignatureUrl(it) &&
+                                isHostInCustomSet(it, customHostSet)
+                        }
                     val customCandidates = if (isAllAkamaiMultiDonor) {
                         deduplicateUrlsPreservingVariants(allowedOriginals + synthesizedList)
                     } else {
@@ -450,18 +555,18 @@ object BtrSessionManager {
                     } else {
                         deduplicateUrlsByHost(
                             cleanIsolated + akamaiOrP2pFallbacks + relayFallbacks,
-                            excludeHost = primaryHostLower
+                            excludeHost = activePrimaryHostLower
                         )
                     }
                 } else if (isAllAkamaiMultiDonor) {
                     deduplicateUrlsPreservingVariants(
-                        cleanIsolated + synthesizedList + akamaiOrP2pFallbacks + relayFallbacks,
-                        excludeUrl = primaryUrl
+                        cleanIsolated + synthesizedList + akamaiOrP2pFallbacks + extraOriginFallbacks + relayFallbacks,
+                        excludeUrl = resolvedPrimaryUrl
                     )
                 } else {
                     deduplicateUrlsByHost(
-                        cleanIsolated + synthesizedList + akamaiOrP2pFallbacks + relayFallbacks,
-                        excludeHost = primaryHostLower
+                        cleanIsolated + synthesizedList + akamaiOrP2pFallbacks + extraOriginFallbacks + relayFallbacks,
+                        excludeHost = activePrimaryHostLower
                     )
                 }
             } else {
@@ -481,8 +586,8 @@ object BtrSessionManager {
             sessionId = id,
             primaryUrl = resolvedPrimaryUrl,
             backupUrls = finalBackups,
-            userAgent = userAgent,
-            referer = referer,
+            userAgent = sanitizedUserAgent,
+            referer = resolvedReferer,
             isAudio = isAudio,
             isEpisode = isEpisode,
             isLive = isLive,
@@ -492,7 +597,10 @@ object BtrSessionManager {
             urlDeadlineEpochSec = deadlineSec,
             refreshProvider = refreshCb,
             liveHostUrls = liveHostUrlsMap,
-            liveCustomPoolOnly = isLiveCustomOnly
+            liveCustomPoolOnly = isLiveCustomOnly,
+            extraHeaders = sanitizedExtraHeaders,
+            rawPrimaryUrl = effectiveRawPrimary,
+            primaryIsRewrittenFromUntrusted = effectivePrimaryUntrusted
         )
         sessions[id] = session
         latestSessionId = id
@@ -825,19 +933,9 @@ object BtrSessionManager {
     private fun isEligibleCleanDonor(url: String): Boolean {
         if (url.isBlank() || isAkamaiSignedUrl(url)) return false
         val parsed = BiliAcceleratorCore.parseUri(url) ?: return false
-        if (!parsed.path.contains("/upgcxcode/")) return false
-        if (parsed.path.startsWith("/v1/resource/", ignoreCase = true)) return false
         val host = BiliAcceleratorCore.normalizeHost(parsed.host)
-        if (host.isBlank() || isLoopbackHost(host) || host.endsWith(".bstarstatic.com")) return false
-        if (BiliAcceleratorCore.isIpAddress(host) ||
-            BiliAcceleratorCore.isKnownP2pHost(host) ||
-            BiliAcceleratorCore.isMcdnHost(host) ||
-            BiliAcceleratorCore.isSchedulerHost(host) ||
-            BiliAcceleratorCore.isAkamaiHost(host)
-        ) return false
-        if (parsed.port != -1 && parsed.port != 80 && parsed.port != 443) return false
-        if (BiliAcceleratorCore.isRelayUrl(url) || BiliAcceleratorCore.hasDrmSignal(url)) return false
-        return true
+        if (host.isBlank() || isLoopbackHost(host)) return false
+        return BiliAcceleratorCore.isCleanUposDonor(url, requireUpgcxcode = true)
     }
 
     private fun extractDeadlineSeconds(url: String): Long {
@@ -906,6 +1004,10 @@ object BtrSessionManager {
                     session.urlDeadlineEpochSec = newDeadline
                     session.refreshConsecutiveFailures.set(0)
                     session.nextRefreshAllowedAtMs = 0L
+                    if (cleanDonorFromRefresh != null) {
+                        session.primaryIsRewrittenFromUntrusted = false
+                        session.banList.clearTransient4xxRefusals()
+                    }
 
                     val isPrimaryRelay = BiliAcceleratorCore.isRelayUrl(resolvedPrimary)
                     val customVodHosts = effectiveCustomVodHosts(session.config)
@@ -1037,31 +1139,44 @@ object BtrSessionManager {
             val isCustomMode = customVodHosts.isNotEmpty()
             val customHostSet = if (isCustomMode) customVodHosts.toSet() else emptySet()
 
-            // 当初始 URL 为带 /upgcxcode/ 的 MCDN/PCDN（含代理包装）且后续补充到同资产官方 UPOS 备用镜像时，升级主地址并释放全池镜像
+            // 当初始 URL 为带 /upgcxcode/ 的 MCDN/PCDN/边缘节点（含已被提前换壳为 UPOS 的伪主源）
+            // 且后续补充到同资产真实官方 UPOS 备用镜像时，立即升级主地址并用真实签名释放全池镜像
+            val currentPrimaryHostClean = BiliAcceleratorCore.isCleanUposDonor(current.primaryUrl, requireUpgcxcode = true)
+            val currentPrimaryAddr = addressKeyOf(current.primaryUrl)
+            val primaryNeedsPromotion = !currentPrimaryHostClean || current.primaryIsRewrittenFromUntrusted
             val promotedUposDonor = if (
                 !current.isLive &&
                 currentPath.contains("/upgcxcode/") &&
-                !BiliAcceleratorCore.isCleanUposDonor(current.primaryUrl, requireUpgcxcode = true)
+                primaryNeedsPromotion
             ) {
                 validBackups
-                    .map { BiliAcceleratorCore.unwrapSmtcdnsUrl(it).ifBlank { it } }
+                    .map { u ->
+                        val step1 = BiliAcceleratorCore.unwrapSmtcdnsUrl(u).ifBlank { u }
+                        BiliAcceleratorCore.extractSchedulerSourceUrl(step1) ?: step1
+                    }
                     .firstOrNull { backup ->
                         !isAkamaiSignedUrl(backup) &&
                             BiliAcceleratorCore.isCleanUposDonor(backup, requireUpgcxcode = true) &&
-                            extractNormalizedPathAndKey(backup).first == currentPath
+                            extractNormalizedPathAndKey(backup).first == currentPath &&
+                            (!currentPrimaryHostClean || addressKeyOf(backup) != currentPrimaryAddr)
                     }
             } else {
                 null
             }
             if (promotedUposDonor != null) {
                 val previousPrimary = current.primaryUrl
+                val wasUntrustedRewritten = current.primaryIsRewrittenFromUntrusted
+                val previousRawPrimary = current.rawPrimaryUrl
                 val previousSynth = current.synthesizedMirrors.toSet()
                 val existingRealNonRelay = current.backupUrls.filter {
                     it !in previousSynth && !BiliAcceleratorCore.isRelayUrl(it)
                 }
                 val existingRelayAndOrig = buildList {
-                    if (!current.isLive && previousPrimary.isNotBlank() && previousPrimary != promotedUposDonor) {
-                        add(previousPrimary)
+                    if (!current.isLive) {
+                        val origToKeep = if (wasUntrustedRewritten) previousRawPrimary else previousPrimary
+                        if (!origToKeep.isNullOrBlank() && origToKeep != promotedUposDonor) {
+                            add(origToKeep)
+                        }
                     }
                     addAll(current.backupUrls.filter { BiliAcceleratorCore.isRelayUrl(it) })
                 }
@@ -1070,6 +1185,8 @@ object BtrSessionManager {
                 if (deadlineSec > current.urlDeadlineEpochSec) {
                     current.urlDeadlineEpochSec = deadlineSec
                 }
+                current.primaryIsRewrittenFromUntrusted = false
+                current.banList.clearTransient4xxRefusals()
                 if (isCustomMode) {
                     val synth = synthesizeCompatibleBackupsForDonors(
                         donors = listOf(promotedUposDonor),
@@ -1080,8 +1197,15 @@ object BtrSessionManager {
                         excludeDonorHost = false
                     )
                     val allowedOriginals = (listOf(promotedUposDonor) + validBackups)
-                        .map { BiliAcceleratorCore.unwrapSmtcdnsUrl(it).ifBlank { it } }
-                        .filter { !BiliAcceleratorCore.isRelayUrl(it) && isHostInCustomSet(it, customHostSet) }
+                        .map { u ->
+                            val step1 = BiliAcceleratorCore.unwrapSmtcdnsUrl(u).ifBlank { u }
+                            BiliAcceleratorCore.extractSchedulerSourceUrl(step1) ?: step1
+                        }
+                        .filter {
+                            !BiliAcceleratorCore.isRelayUrl(it) &&
+                                !BiliAcceleratorCore.isEdgeBoundSignatureUrl(it) &&
+                                isHostInCustomSet(it, customHostSet)
+                        }
                     val customCandidates = deduplicateUrlsByHost(allowedOriginals + synth)
                     if (customCandidates.isNotEmpty()) {
                         current.synthesizedMirrors = synth
@@ -1093,24 +1217,27 @@ object BtrSessionManager {
                 }
 
                 current.primaryUrl = promotedUposDonor
-                if (current.config != null || current.synthesizedMirrors.isNotEmpty() || isPrimaryRelay) {
+                if (current.config != null || current.synthesizedMirrors.isNotEmpty() || isPrimaryRelay || wasUntrustedRewritten) {
                     current.synthesizedMirrors = synthesizeCompatibleBackups(
                         promotedUposDonor,
                         current.config,
                         isEpisode = current.isEpisode
                     )
                 }
-                val unwrappedIncoming = validBackups.map { BiliAcceleratorCore.unwrapSmtcdnsUrl(it).ifBlank { it } }
+                val unwrappedIncoming = validBackups.map { u ->
+                    val step1 = BiliAcceleratorCore.unwrapSmtcdnsUrl(u).ifBlank { u }
+                    BiliAcceleratorCore.extractSchedulerSourceUrl(step1) ?: step1
+                }
                 val incomingNonRelay = unwrappedIncoming.filter { !BiliAcceleratorCore.isRelayUrl(it) }
                 val incomingRelay = validBackups.filter { BiliAcceleratorCore.isRelayUrl(it) }
                 val cleanBackups = (incomingNonRelay + existingRealNonRelay).filter {
-                    !isFallbackOrP2pUrl(it) && !isAkamaiSignedUrl(it)
+                    !isFallbackOrP2pUrl(it) && !isAkamaiSignedUrl(it) && !BiliAcceleratorCore.isEdgeBoundSignatureUrl(it)
                 }
                 val akamaiFallbacks = (incomingNonRelay + existingRealNonRelay).filter {
                     isAkamaiSignedUrl(it)
                 }
                 val p2pFallbacks = (incomingNonRelay + existingRealNonRelay).filter {
-                    isFallbackOrP2pUrl(it)
+                    (isFallbackOrP2pUrl(it) || BiliAcceleratorCore.isEdgeBoundSignatureUrl(it)) && !isAkamaiSignedUrl(it)
                 }
                 current.backupUrls = deduplicateUrlsByHost(
                     cleanBackups + current.synthesizedMirrors + akamaiFallbacks + p2pFallbacks + incomingRelay + existingRelayAndOrig,
@@ -1146,15 +1273,25 @@ object BtrSessionManager {
                 val cleanIncoming = if (isPrimaryRelay) {
                     isolatedBackups
                 } else {
-                    isolatedBackups.filter { !isFallbackOrP2pUrl(it) && !isAkamaiSignedUrl(it) }
+                    isolatedBackups.filter {
+                        !isFallbackOrP2pUrl(it) &&
+                            !isAkamaiSignedUrl(it) &&
+                            !BiliAcceleratorCore.isEdgeBoundSignatureUrl(it)
+                    }
                 }
                 val cleanExisting = existingRealNonRelay.filter {
-                    !isFallbackOrP2pUrl(it) && !isAkamaiSignedUrl(it)
+                    !isFallbackOrP2pUrl(it) &&
+                        !isAkamaiSignedUrl(it) &&
+                        !BiliAcceleratorCore.isEdgeBoundSignatureUrl(it)
                 }
                 val incomingAkamai = if (isPrimaryRelay) emptyList() else isolatedBackups.filter { isAkamaiSignedUrl(it) }
                 val existingAkamai = existingRealNonRelay.filter { isAkamaiSignedUrl(it) }
-                val incomingP2p = if (isPrimaryRelay) emptyList() else isolatedBackups.filter { isFallbackOrP2pUrl(it) }
-                val existingP2p = existingRealNonRelay.filter { isFallbackOrP2pUrl(it) }
+                val incomingP2p = if (isPrimaryRelay) emptyList() else isolatedBackups.filter {
+                    (isFallbackOrP2pUrl(it) || BiliAcceleratorCore.isEdgeBoundSignatureUrl(it)) && !isAkamaiSignedUrl(it)
+                }
+                val existingP2p = existingRealNonRelay.filter {
+                    (isFallbackOrP2pUrl(it) || BiliAcceleratorCore.isEdgeBoundSignatureUrl(it)) && !isAkamaiSignedUrl(it)
+                }
 
                 // 自定义 CDN 池隔离：已处于自定义池中的 VOD 会话仅接纳自定义池内的备份，不混入非自定义节点
                 if (!current.isLive && !isPrimaryRelay && isCustomMode) {
@@ -1254,6 +1391,20 @@ object BtrSessionManager {
                         current.config != null ||
                             (current.synthesizedMirrors.isNotEmpty() && isolatedBackups.none { !isAkamaiSignedUrl(it) })
                         )
+                    if (!current.isLive && !isPrimaryRelay && current.synthesizedMirrors.isEmpty() && current.config != null) {
+                        val verifiedDonor = cleanIncoming.firstOrNull { isEligibleCleanDonor(it) }
+                        if (verifiedDonor != null) {
+                            current.primaryIsRewrittenFromUntrusted = false
+                            current.synthesizedMirrors = synthesizeCompatibleBackupsForDonors(
+                                donors = listOf(verifiedDonor),
+                                config = current.config,
+                                isEpisode = current.isEpisode,
+                                allowAkamaiDonor = false,
+                                excludeUrl = current.primaryUrl,
+                                excludeDonorHost = true
+                            )
+                        }
+                    }
                     val synthMirrors = if (shouldKeepSynthesized) current.synthesizedMirrors else emptyList()
                     val hasMultiVariants = synthMirrors.groupingBy { hostKeyOf(it) }.eachCount().values.any { it > 1 }
                     current.backupUrls = if (hasMultiVariants) {
@@ -1434,21 +1585,27 @@ object BtrSessionManager {
             if (path.startsWith("/v1/resource/", ignoreCase = true)) continue
 
             val host = BiliAcceleratorCore.normalizeHost(uri.host)
-            // 本地回环（含 IPv4/IPv6/IPv4-mapped）、IP/P2P/非标端口、中继、DRM、未开启允许时的 Akamai 与 bstarstatic 严禁合成普通 UPOS 镜像
+            // 本地回环（含 IPv4/IPv6/IPv4-mapped）、IP/P2P/非标端口、中继、DRM、BCache/边缘专属 os=、未开启允许时的 Akamai 与 bstarstatic 严禁合成普通 UPOS 镜像
             if (host.isBlank() ||
                 isLoopbackHost(host) ||
                 BiliAcceleratorCore.isIpAddress(host) ||
                 BiliAcceleratorCore.isKnownP2pHost(host) ||
                 BiliAcceleratorCore.isMcdnHost(host) ||
                 BiliAcceleratorCore.isSchedulerHost(host) ||
+                BiliAcceleratorCore.isBcacheHost(host) ||
                 (uri.port != -1 && uri.port != 80 && uri.port != 443) ||
                 BiliAcceleratorCore.isRelayUrl(donor) ||
+                BiliAcceleratorCore.isEdgeBoundOsParam(donor) ||
                 BiliAcceleratorCore.hasDrmSignal(donor) ||
                 host.endsWith(".bstarstatic.com")
             ) {
                 continue
             }
-            if (isAkamaiSignedUrl(donor) && (!allowAkamaiDonor || (config != null && !isAkamaiDonorEnabled(config)))) {
+            if (isAkamaiSignedUrl(donor)) {
+                if (!allowAkamaiDonor || (config != null && !isAkamaiDonorEnabled(config))) {
+                    continue
+                }
+            } else if (!BiliAcceleratorCore.isCleanUposDonor(donor, requireUpgcxcode = true)) {
                 continue
             }
             eligibleDonors.add(uri to host)

@@ -552,9 +552,51 @@ object BiliAcceleratorCore {
         return parsed.queryParam("os")?.equals("mcdn", ignoreCase = true) == true
     }
 
+    private val EDGE_BOUND_OS_VALUES = setOf(
+        "mcdn",
+        "bcache",
+        "ppio",
+        "xy",
+        "p2p",
+        "pcdn",
+        "ks3",
+        "08cbv"
+    )
+
+    fun isBcacheHost(hostname: String): Boolean {
+        val h = normalizeHost(hostname)
+        if (h.isBlank()) return false
+        return h.contains("-bcache-") || h.contains(".bcache.")
+    }
+
+    fun isEdgeBoundOsParam(url: String): Boolean {
+        if (url.isBlank()) return false
+        val osParam = parseUri(url)?.queryParam("os")?.trim()?.lowercase() ?: return false
+        return osParam in EDGE_BOUND_OS_VALUES
+    }
+
+    fun isEdgeBoundSignatureUrl(url: String): Boolean {
+        if (url.isBlank()) return false
+        if (isEdgeBoundOsParam(url)) return true
+        val host = normalizeHost(parseUri(url)?.host)
+        return isBcacheHost(host)
+    }
+
+    fun isAppPlatformUrl(url: String): Boolean {
+        if (url.isBlank()) return false
+        val platform = parseUri(url)?.queryParam("platform")?.trim()?.lowercase() ?: return false
+        return platform == "android" ||
+            platform.startsWith("android_") ||
+            platform == "ios" ||
+            platform == "iphone" ||
+            platform == "ipad" ||
+            platform == "tv" ||
+            platform == "ott"
+    }
+
     fun isUposHost(hostname: String): Boolean {
         val h = normalizeHost(hostname)
-        if (h.isBlank() || isKnownP2pHost(h)) return false
+        if (h.isBlank() || isKnownP2pHost(h) || isBcacheHost(h)) return false
         return UPOS_HOST_REGEX.matches(h)
     }
 
@@ -1079,6 +1121,14 @@ object BiliAcceleratorCore {
             return noChange(original, "mcdn-relay-pass", isPcdn = true, isMcdn = false, segmentKey = segKey)
         }
 
+        // 2.6 省级自建缓存 cn-*-bcache-* 及边缘专属 os=bcache/ppio/xy/p2p/pcdn 签名防护：
+        // 这类地址携带节点/边缘强绑定签名，直接改写 Host 到 upos-sz-mirror* 会 100% 返回 HTTP 403；
+        // 严禁跨节点替换 Host，原样放行（若备选池存在干净官方 UPOS，则由上层按整条 URL 提权替换）。
+        val isEdgeBound = isBcacheHost(hostname) || isEdgeBoundOsParam(original)
+        if (isEdgeBound) {
+            return noChange(original, "edge-bound-pass", isPcdn = isPcdn, isMcdn = false, segmentKey = segKey)
+        }
+
         // 3. Akamai 节点处理：默认放行官方 Akamai 鉴权线路；杜绝非 BTR 模式下直接改写 Host 导致 403 播放失败
         val isAkamai = isAkamaiHost(hostname)
         val isBstar = hostname.endsWith(".bstarstatic.com", ignoreCase = true)
@@ -1092,7 +1142,7 @@ object BiliAcceleratorCore {
         // 4. PCDN 拦截 / Force 模式 / Akamai 改写
         val shouldRewrite = (isPcdn && config.blockPcdn) ||
                 (isAkamai && config.rewriteAkamai && config.enableBtr) ||
-                (config.forceUpos && isBiliCdnHost(hostname) && !isAkamai && !isBstar)
+                (config.forceUpos && isBiliCdnHost(hostname) && !isAkamai && !isBstar && !isBcacheHost(hostname))
 
         if (shouldRewrite) {
             val target = resolveTargetHost(config)
@@ -1127,12 +1177,13 @@ object BiliAcceleratorCore {
         val parsed = parseUri(url) ?: return false
         val host = normalizeHost(parsed.host)
         if (host.isBlank() || isIpAddress(host) || isKnownP2pHost(host) || isMcdnHost(host) ||
-            isAkamaiHost(host) || isSchedulerHost(host) || host.endsWith(".bstarstatic.com")
+            isAkamaiHost(host) || isSchedulerHost(host) || isBcacheHost(host) ||
+            host.endsWith(".bstarstatic.com")
         ) {
             return false
         }
         if (parsed.port != -1 && parsed.port != 80 && parsed.port != 443) return false
-        if (isRelayUrl(url) || hasDrmSignal(url) || isEpisodePreview(url)) return false
+        if (isRelayUrl(url) || isEdgeBoundOsParam(url) || hasDrmSignal(url) || isEpisodePreview(url)) return false
         if (requireUpgcxcode && !parsed.path.contains("/upgcxcode/")) return false
         return isUposHost(host) || (host.startsWith("cn-hk-eq-") && host.endsWith(".bilivideo.com"))
     }

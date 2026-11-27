@@ -1271,4 +1271,42 @@ class BiliAcceleratorCoreTest {
             assertTrue("Bilibili media URL must match isMediaUrl: $url", BiliAcceleratorCore.isMediaUrl(url))
         }
     }
+
+    @Test
+    fun testBcacheAndEdgeBoundOsIsolationAndAppPlatformDetection() {
+        val bcacheUrl = "https://cn-zj-hz-bcache-01.bilivideo.com/upgcxcode/54/12/34567.m4s?os=bcache&deadline=1899999999"
+        val ppioParamUrl = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/54/12/34567.m4s?os=ppio&deadline=1899999999"
+        val xyParamUrl = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/54/12/34567.m4s?os=xy&deadline=1899999999"
+        val cleanUposUrl = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/54/12/34567.m4s?os=upos&deadline=1899999999"
+
+        assertTrue(BiliAcceleratorCore.isBcacheHost("cn-zj-hz-bcache-01.bilivideo.com"))
+        assertFalse(BiliAcceleratorCore.isBcacheHost("upos-sz-mirrorcos.bilivideo.com"))
+        assertFalse("bcache host must not be classified as standard UPOS host", BiliAcceleratorCore.isUposHost("cn-zj-hz-bcache-01.bilivideo.com"))
+
+        assertTrue(BiliAcceleratorCore.isEdgeBoundOsParam(bcacheUrl))
+        assertTrue(BiliAcceleratorCore.isEdgeBoundOsParam(ppioParamUrl))
+        assertTrue(BiliAcceleratorCore.isEdgeBoundOsParam(xyParamUrl))
+        assertFalse(BiliAcceleratorCore.isEdgeBoundOsParam(cleanUposUrl))
+
+        assertFalse("bcache URL must not be a clean UPOS donor", BiliAcceleratorCore.isCleanUposDonor(bcacheUrl))
+        assertFalse("os=ppio URL must not be a clean UPOS donor", BiliAcceleratorCore.isCleanUposDonor(ppioParamUrl))
+        assertFalse("os=xy URL must not be a clean UPOS donor", BiliAcceleratorCore.isCleanUposDonor(xyParamUrl))
+        assertTrue("Clean UPOS URL must be accepted as donor", BiliAcceleratorCore.isCleanUposDonor(cleanUposUrl))
+
+        val forceCfg = defaultConfig.copy(blockPcdn = true, forceUpos = true, targetHost = "upos-sz-mirrorali.bilivideo.com")
+        val bcacheRes = BiliAcceleratorCore.rewriteUrl(bcacheUrl, forceCfg)
+        assertFalse("bcache URL must not be host-swapped even with forceUpos=true", bcacheRes.changed)
+        assertEquals("edge-bound-pass", bcacheRes.reason)
+        assertEquals(bcacheUrl, bcacheRes.finalUrl)
+
+        val ppioRes = BiliAcceleratorCore.rewriteUrl(ppioParamUrl, forceCfg)
+        assertFalse("os=ppio URL must not be host-swapped even with forceUpos=true", ppioRes.changed)
+        assertEquals("edge-bound-pass", ppioRes.reason)
+
+        assertTrue(BiliAcceleratorCore.isAppPlatformUrl("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.m4s?platform=android&os=upos"))
+        assertTrue(BiliAcceleratorCore.isAppPlatformUrl("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.m4s?platform=android_i"))
+        assertTrue(BiliAcceleratorCore.isAppPlatformUrl("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.m4s?platform=ios"))
+        assertFalse(BiliAcceleratorCore.isAppPlatformUrl("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.m4s?platform=pc"))
+        assertFalse(BiliAcceleratorCore.isAppPlatformUrl("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.m4s?os=upos"))
+    }
 }

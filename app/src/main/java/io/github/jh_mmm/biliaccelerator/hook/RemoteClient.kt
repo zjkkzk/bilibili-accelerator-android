@@ -61,7 +61,49 @@ object RemoteClient {
 
     @Volatile
     private var appContext: Context? = null
+    @Volatile
+    private var cachedHostPlayerUa: String? = null
     private val contextInitialized = AtomicBoolean(false)
+
+    internal const val FALLBACK_PLAYER_USER_AGENT = "Bilibili Freedoooooom/MarkII"
+
+    fun resolveHostPlayerUserAgent(): String {
+        cachedHostPlayerUa?.let { return it }
+        val ctx = appContext ?: return FALLBACK_PLAYER_USER_AGENT
+        val built = runCatching {
+            val pkg = ctx.packageName?.trim()?.takeIf { it.isNotEmpty() } ?: return@runCatching null
+            if (!BiliAcceleratorCore.isTargetPackage(pkg)) return@runCatching null
+            val pm = ctx.packageManager ?: return@runCatching null
+            val pi = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                pm.getPackageInfo(pkg, android.content.pm.PackageManager.PackageInfoFlags.of(0))
+            } else {
+                @Suppress("DEPRECATION")
+                pm.getPackageInfo(pkg, 0)
+            }
+            val verName = pi?.versionName?.trim()?.takeIf { it.isNotEmpty() } ?: "8.24.0"
+            val verCode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                pi?.longVersionCode ?: 8240300L
+            } else {
+                @Suppress("DEPRECATION")
+                pi?.versionCode?.toLong() ?: 8240300L
+            }
+            val model = Build.MODEL?.trim()?.takeIf { it.isNotEmpty() } ?: "Android"
+            val osVer = Build.VERSION.RELEASE?.trim()?.takeIf { it.isNotEmpty() } ?: "14"
+            val mobiApp = when (pkg) {
+                "com.bilibili.app.in" -> "android_i"
+                "tv.danmaku.bilibilihd" -> "android_hd"
+                "com.bilibili.app.blue" -> "android_b"
+                else -> "android"
+            }
+            "Mozilla/5.0 BiliDroid/$verName (bbcallen@gmail.com) os/android model/$model mobi_app/$mobiApp build/$verCode channel/bili innerVer/$verCode osVer/$osVer network/2"
+        }.getOrNull()
+        return if (!built.isNullOrBlank()) {
+            cachedHostPlayerUa = built
+            built
+        } else {
+            FALLBACK_PLAYER_USER_AGENT
+        }
+    }
     private val isObserverRegistered = AtomicBoolean(false)
     private val isSyncReceiverRegistered = AtomicBoolean(false)
     private val isRemotePrefsAttached = AtomicBoolean(false)
@@ -717,6 +759,7 @@ object RemoteClient {
 
     internal fun setAppContextForTesting(context: Context?) {
         appContext = context
+        cachedHostPlayerUa = null
     }
 
     internal fun setLastBroadcastTimeForTesting(timeMs: Long) {
@@ -749,6 +792,7 @@ object RemoteClient {
         pendingBatch.clear()
         lastBroadcastTime.set(0L)
         appContext = null
+        cachedHostPlayerUa = null
     }
 
     internal fun awaitReportSchedulerForTesting(timeoutMs: Long = 2000L) {

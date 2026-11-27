@@ -266,6 +266,29 @@ object BtrLiveEngine {
         )
     }
 
+    private fun buildLiveRequest(
+        url: String,
+        userAgent: String,
+        referer: String?,
+        extraHeaders: Map<String, String> = emptyMap(),
+        rangeHeader: String? = null
+    ): Request {
+        val builder = Request.Builder().url(url)
+        for ((k, v) in extraHeaders) {
+            if (k.isNotBlank() && v.isNotBlank()) {
+                runCatching { builder.header(k, v) }
+            }
+        }
+        if (!rangeHeader.isNullOrBlank()) {
+            builder.header("Range", rangeHeader)
+        }
+        builder.header("User-Agent", userAgent)
+        if (!referer.isNullOrBlank()) {
+            builder.header("Referer", referer)
+        }
+        return builder.build()
+    }
+
     /**
      * 异步并发探测候选节点有效性（对齐 BTR probeCandidates：Promise.allSettled 并发发送 Range: 0-2047 探测包）
      */
@@ -281,8 +304,10 @@ object BtrLiveEngine {
         }
         if (probeTargets.isEmpty()) return
 
-        val ua = session.userAgent ?: "BiliApp/7800300"
+        val ua = session.userAgent?.takeIf { BtrLocalProxyServer.isUsableClientUserAgent(it) }
+            ?: BtrChunkEngine.resolveDefaultUserAgent()
         val ref = session.referer
+        val extra = session.extraHeaders
         for ((host, probeUrl) in probeTargets) {
             try {
                 probingPool.execute {
@@ -292,12 +317,13 @@ object BtrLiveEngine {
                     }
                     var call: Call? = null
                     try {
-                        val req = Request.Builder()
-                            .url(probeUrl)
-                            .header("Range", "bytes=0-2047")
-                            .header("User-Agent", ua)
-                            .header("Referer", ref)
-                            .build()
+                        val req = buildLiveRequest(
+                            url = probeUrl,
+                            userAgent = ua,
+                            referer = ref,
+                            extraHeaders = extra,
+                            rangeHeader = "bytes=0-2047"
+                        )
 
                         val startTime = System.currentTimeMillis()
                         call = BtrHttpClient.probeClient.newCall(req)
@@ -343,7 +369,8 @@ object BtrLiveEngine {
         requestUserAgent: String? = null,
         requestReferer: String? = null,
         firstByteTimeoutMs: Long = FIRST_BYTE_TIMEOUT_MS,
-        segmentTimeoutMs: Long = SEGMENT_TIMEOUT_MS
+        segmentTimeoutMs: Long = SEGMENT_TIMEOUT_MS,
+        extraHeaders: Map<String, String> = emptyMap()
     ): CachedLiveSegment {
         val state = stateFor(session.sessionId)
         if (state.evicted.get()) {
@@ -379,7 +406,7 @@ object BtrLiveEngine {
                 if (state.evicted.get()) throw e
                 state.segmentCache[cacheKey]?.let { return it }
                 if (allow404) throw e
-                downloadFallbackSegment(session, normalizedUrl, requestUserAgent, requestReferer, state)
+                downloadFallbackSegment(session, normalizedUrl, requestUserAgent, requestReferer, state, extraHeaders)
             }
         }
 
@@ -398,8 +425,11 @@ object BtrLiveEngine {
             urgent -> URGENT_HEDGE_MS
             else -> HEDGE_MS
         }
-        val effectiveUa = requestUserAgent ?: session.userAgent ?: "BiliApp/7800300"
+        val effectiveUa = requestUserAgent?.takeIf { BtrLocalProxyServer.isUsableClientUserAgent(it) }
+            ?: session.userAgent?.takeIf { BtrLocalProxyServer.isUsableClientUserAgent(it) }
+            ?: BtrChunkEngine.resolveDefaultUserAgent()
         val effectiveRef = requestReferer ?: session.referer
+        val effectiveExtra = if (extraHeaders.isNotEmpty()) extraHeaders else session.extraHeaders
         val activeAttempts = mutableListOf<ActiveSegmentAttempt>()
         val isCompleted = AtomicBoolean(false)
         val totalTimedOut = AtomicBoolean(false)
@@ -421,11 +451,12 @@ object BtrLiveEngine {
                 }
                 return
             }
-            val req = Request.Builder()
-                .url(targetUrl)
-                .header("User-Agent", effectiveUa)
-                .header("Referer", effectiveRef)
-                .build()
+            val req = buildLiveRequest(
+                url = targetUrl,
+                userAgent = effectiveUa,
+                referer = effectiveRef,
+                extraHeaders = effectiveExtra
+            )
 
             val call = BtrHttpClient.client.newCall(req)
             val receivedBytes = AtomicLong(0L)
@@ -626,7 +657,7 @@ object BtrLiveEngine {
                 throw err
             }
             try {
-                val fb = downloadFallbackSegment(session, normalizedUrl, effectiveUa, effectiveRef, state)
+                val fb = downloadFallbackSegment(session, normalizedUrl, effectiveUa, effectiveRef, state, effectiveExtra)
                 future.complete(fb)
                 fb
             } catch (fbErr: Throwable) {
@@ -643,14 +674,20 @@ object BtrLiveEngine {
         url: String,
         requestUserAgent: String? = null,
         requestReferer: String? = null,
-        state: LiveSessionState = stateFor(session.sessionId)
+        state: LiveSessionState = stateFor(session.sessionId),
+        extraHeaders: Map<String, String> = emptyMap()
     ): CachedLiveSegment {
         val normalizedUrl = BtrLiveCore.unwrapProxyUrl(url).ifBlank { url }
-        val fallbackReq = Request.Builder()
-            .url(normalizedUrl)
-            .header("User-Agent", requestUserAgent ?: session.userAgent ?: "BiliApp/7800300")
-            .header("Referer", requestReferer ?: session.referer)
-            .build()
+        val ua = requestUserAgent?.takeIf { BtrLocalProxyServer.isUsableClientUserAgent(it) }
+            ?: session.userAgent?.takeIf { BtrLocalProxyServer.isUsableClientUserAgent(it) }
+            ?: BtrChunkEngine.resolveDefaultUserAgent()
+        val ref = requestReferer ?: session.referer
+        val fallbackReq = buildLiveRequest(
+            url = normalizedUrl,
+            userAgent = ua,
+            referer = ref,
+            extraHeaders = if (extraHeaders.isNotEmpty()) extraHeaders else session.extraHeaders
+        )
         val call = BtrHttpClient.client.newCall(fallbackReq)
         state.activeCalls.add(call)
         return try {
@@ -705,7 +742,8 @@ object BtrLiveEngine {
         keepAlive: Boolean = false,
         isHeadOnly: Boolean = false,
         requestUserAgent: String? = null,
-        requestReferer: String? = null
+        requestReferer: String? = null,
+        extraHeaders: Map<String, String> = emptyMap()
     ): Boolean {
         val state = stateFor(session.sessionId)
         val requestedSubUrl = extractUrlFromPath(requestPath)
@@ -737,17 +775,21 @@ object BtrLiveEngine {
             listOf(originalUrl to origHost)
         }
 
-        val ua = requestUserAgent ?: session.userAgent ?: "BiliApp/7800300"
+        val ua = requestUserAgent?.takeIf { BtrLocalProxyServer.isUsableClientUserAgent(it) }
+            ?: session.userAgent?.takeIf { BtrLocalProxyServer.isUsableClientUserAgent(it) }
+            ?: BtrChunkEngine.resolveDefaultUserAgent()
         val ref = requestReferer ?: session.referer
+        val effectiveExtra = if (extraHeaders.isNotEmpty()) extraHeaders else session.extraHeaders
         var lastErrorCode = 502
         var lastErrorMessage = "Upstream error"
 
         for ((playlistFetchUrl, candHost) in candidateUrls) {
-            val req = Request.Builder()
-                .url(playlistFetchUrl)
-                .header("User-Agent", ua)
-                .header("Referer", ref)
-                .build()
+            val req = buildLiveRequest(
+                url = playlistFetchUrl,
+                userAgent = ua,
+                referer = ref,
+                extraHeaders = effectiveExtra
+            )
             val startTime = System.currentTimeMillis()
             val call = BtrHttpClient.client.newCall(req)
             state.activeCalls.add(call)
@@ -1184,7 +1226,8 @@ object BtrLiveEngine {
         keepAlive: Boolean,
         isHeadOnly: Boolean,
         requestUserAgent: String?,
-        requestReferer: String?
+        requestReferer: String?,
+        extraHeaders: Map<String, String> = emptyMap()
     ): Boolean {
         val pool = session.liveHostPool
         val candidateUrls = buildList {
@@ -1197,18 +1240,22 @@ object BtrLiveEngine {
             add(targetUrl)
         }.distinct()
 
-        val effectiveUa = requestUserAgent ?: session.userAgent ?: "BiliApp/7800300"
+        val effectiveUa = requestUserAgent?.takeIf { BtrLocalProxyServer.isUsableClientUserAgent(it) }
+            ?: session.userAgent?.takeIf { BtrLocalProxyServer.isUsableClientUserAgent(it) }
+            ?: BtrChunkEngine.resolveDefaultUserAgent()
         val effectiveRef = requestReferer ?: session.referer
+        val effectiveExtra = if (extraHeaders.isNotEmpty()) extraHeaders else session.extraHeaders
         var lastErrorCode = 502
 
         for (candUrl in candidateUrls) {
             if (state.evicted.get()) return false
-            val req = Request.Builder()
-                .url(candUrl)
-                .header("Range", rangeHeader)
-                .header("User-Agent", effectiveUa)
-                .header("Referer", effectiveRef)
-                .build()
+            val req = buildLiveRequest(
+                url = candUrl,
+                userAgent = effectiveUa,
+                referer = effectiveRef,
+                extraHeaders = effectiveExtra,
+                rangeHeader = rangeHeader
+            )
             val call = BtrHttpClient.client.newCall(req)
             state.activeCalls.add(call)
             var headersSent = false
@@ -1282,7 +1329,8 @@ object BtrLiveEngine {
         keepAlive: Boolean = false,
         isHeadOnly: Boolean = false,
         requestUserAgent: String? = null,
-        requestReferer: String? = null
+        requestReferer: String? = null,
+        extraHeaders: Map<String, String> = emptyMap()
     ): Boolean {
         val state = stateFor(session.sessionId)
         val rawTargetUrl = extractUrlFromPath(requestPath) ?: run {
@@ -1329,7 +1377,8 @@ object BtrLiveEngine {
                     keepAlive = keepAlive,
                     isHeadOnly = isHeadOnly,
                     requestUserAgent = requestUserAgent,
-                    requestReferer = requestReferer
+                    requestReferer = requestReferer,
+                    extraHeaders = extraHeaders
                 )
             }
 
@@ -1340,7 +1389,8 @@ object BtrLiveEngine {
                 allow404 = false,
                 isSpeculative = false,
                 requestUserAgent = requestUserAgent,
-                requestReferer = requestReferer
+                requestReferer = requestReferer,
+                extraHeaders = extraHeaders
             )
             val headerBuilder = StringBuilder()
             headerBuilder.append("HTTP/1.1 200 OK\r\n")
@@ -1400,7 +1450,8 @@ object BtrLiveEngine {
         isHeadOnly: Boolean = false,
         requestUserAgent: String? = null,
         requestReferer: String? = null,
-        timeoutMs: Long = SEGMENT_TIMEOUT_MS
+        timeoutMs: Long = SEGMENT_TIMEOUT_MS,
+        extraHeaders: Map<String, String> = emptyMap()
     ): Boolean {
         val state = stateFor(session.sessionId)
         val originalUrl = BtrLiveCore.unwrapProxyUrl(session.primaryUrl).ifBlank { session.primaryUrl }
@@ -1419,8 +1470,11 @@ object BtrLiveEngine {
             listOf(fallbackHost to originalUrl)
         }
 
-        val effectiveUa = requestUserAgent ?: session.userAgent ?: "BiliApp/7800300"
+        val effectiveUa = requestUserAgent?.takeIf { BtrLocalProxyServer.isUsableClientUserAgent(it) }
+            ?: session.userAgent?.takeIf { BtrLocalProxyServer.isUsableClientUserAgent(it) }
+            ?: BtrChunkEngine.resolveDefaultUserAgent()
         val effectiveRef = requestReferer ?: session.referer
+        val effectiveExtra = if (extraHeaders.isNotEmpty()) extraHeaders else session.extraHeaders
         val winnerFuture = CompletableFuture<FlvRaceWinner?>()
         val winnerClaimed = AtomicBoolean(false)
         val timedOut = AtomicBoolean(false)
@@ -1432,11 +1486,12 @@ object BtrLiveEngine {
 
         fun connectCandidate(host: String, targetUrl: String, isPrimary: Boolean) {
             if (state.evicted.get() || raceFinished.get() || winnerClaimed.get()) return
-            val req = Request.Builder()
-                .url(targetUrl)
-                .header("User-Agent", effectiveUa)
-                .header("Referer", effectiveRef)
-                .build()
+            val req = buildLiveRequest(
+                url = targetUrl,
+                userAgent = effectiveUa,
+                referer = effectiveRef,
+                extraHeaders = effectiveExtra
+            )
 
             val call = BtrHttpClient.liveStreamClient.newCall(req)
             val hostPenalized = AtomicBoolean(false)
